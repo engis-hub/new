@@ -1,0 +1,284 @@
+EPS_FIX_DEG = 0.6
+EPS_ORB_DEG = 1.2
+t_fix_in  = np.deg2rad(N_fix_in_deg  + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
+t_fix_out = np.deg2rad(N_fix_out_deg + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
+t_orb_in  = np.deg2rad(N_orb_in_deg  + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
+t_orb_out = np.deg2rad(N_orb_out_deg + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
+
+E = (2*np.pi*Rg - 2*T) / 2.0
+
+def stat_out(t):
+    x = -r*(sin(t) - t*cos(t)) + (T/2.0)*cos(t)
+    y =  r*(cos(t) + t*sin(t)) + (T/2.0)*sin(t)
+    return x, y
+
+def stat_in(t):
+    x = -r*(sin(t) - t*cos(t)) - (T/2.0)*cos(t)
+    y =  r*(cos(t) + t*sin(t)) - (T/2.0)*sin(t)
+    return x, y
+
+def orb_out_local(t):
+    x =  r*(sin(t) - t*cos(t)) - (T/2.0)*cos(t)
+    y = -r*(cos(t) + t*sin(t)) - (T/2.0)*sin(t)
+    return x, y
+
+def orb_in_local(t):
+    x =  r*(sin(t) - t*cos(t)) + (T/2.0)*cos(t)
+    y = -r*(cos(t) + t*sin(t)) + (T/2.0)*sin(t)
+    return x, y
+
+def translate_orbit(x, y, phi):
+    return x + E*np.cos(phi), y - E*np.sin(phi)
+
+def u_dir(phi): return np.array([np.cos(phi), -np.sin(phi)])
+def n_perp(phi):
+    c, s = np.cos(phi), np.sin(phi)
+    return np.array([s, c])
+
+# centerlines
+def stat_center(t): return -r*(sin(t) - t*cos(t)),  r*(cos(t) + t*sin(t))
+def orb_center_local(t): return  r*(sin(t) - t*cos(t)), -r*(cos(t) + t*sin(t))
+def P_stat_center(t): return np.array(stat_center(t))
+def P_orb_center(t, phi): return np.array(translate_orbit(*orb_center_local(t), phi))
+
+def A_stat_center(t0, t1): return (r*r/6.0) * (t1**3 - t0**3)
+def A_orb_center(t0, t1, phi):
+    base = (r*r/6.0) * (t1**3 - t0**3)
+    def F(t): return t*np.sin(phi + t) + np.cos(phi + t)
+    trans = -0.5 * E * r * (F(t1) - F(t0))
+    return base + trans
+
+def area_line_seg(p, q): return 0.5 * (p[0]*q[1] - p[1]*q[0])
+
+def H_line_fixed_in(t, phi):
+    n = n_perp(phi); r0 =  Rg*n
+    x, y = stat_in(t)
+    return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+
+def H_line_fixed_out(t, phi):
+    n = n_perp(phi); r0 = -Rg*n
+    x, y = stat_out(t)
+    return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+
+def H_line_orbit_out(t, phi):
+    n = n_perp(phi); r0 =  Rg*n
+    x, y = translate_orbit(*orb_out_local(t), phi)
+    return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+
+def H_line_orbit_in(t, phi):
+    n = n_perp(phi); r0 = -Rg*n
+    x, y = translate_orbit(*orb_in_local(t), phi)
+    return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+
+def refine_root_bisect(func, a, b, phi, itmax=60, tol=1e-12):
+    fa, fb = func(a, phi), func(b, phi)
+    if fa*fb > 0: return None
+    lo, hi, flo, fhi = a, b, fa, fb
+    for _ in range(itmax):
+        m = 0.5*(lo + hi)
+        fm = func(m, phi)
+        if abs(fm) <= 1e-14 or (hi - lo)/2 < tol*(1+abs(m)): return m
+        if flo*fm <= 0: hi, fhi = m, fm
+        else:           lo, flo = m, fm
+    return 0.5*(lo + hi)
+
+def find_roots(func, phi, tmin, tmax, M=18000, tol_zero=1e-9):
+    ts = np.linspace(tmin, tmax, M+1)
+    Hs = func(ts, phi)
+    roots = []
+    nz = np.where(np.abs(Hs) <= tol_zero)[0]
+    for idx in nz.tolist():
+        roots.append(ts[idx])
+    for i in range(M):
+        a, b = ts[i], ts[i+1]
+        fa, fb = Hs[i], Hs[i+1]
+        if fa*fb < 0:
+            m = refine_root_bisect(func, a, b, phi)
+            if m is not None: roots.append(m)
+        else:
+            if abs(fa) < 10*tol_zero:
+                left = max(tmin, a - (tmax-tmin)/M)
+                m = refine_root_bisect(func, left, min(b, a+(tmax-tmin)/M), phi)
+                if m is not None: roots.append(m)
+            if abs(fb) < 10*tol_zero:
+                right = min(tmax, b + (tmax-tmin)/M)
+                m = refine_root_bisect(func, max(a, b-(tmax-tmin)/M), right, phi)
+                if m is not None: roots.append(m)
+    roots = sorted(set([float(np.round(r, 10)) for r in roots]))
+    return roots
+
+def filter_and_sort_on_halfline(points_xy, phi, side):
+    n = n_perp(phi); u = u_dir(phi)
+    r0 = ( Rg*n if side=='L' else -Rg*n )
+    s_vals = [float(np.dot(p - r0, u)) for p in points_xy]
+    if side == 'L':
+        idx = [i for i,s in enumerate(s_vals) if s > 0]
+    else:
+        idx = [i for i,s in enumerate(s_vals) if s < 0]
+    pts = [points_xy[i] for i in idx]
+    s_keep = [s_vals[i] for i in idx]
+    order = np.argsort(s_keep)
+    pts_sorted = [pts[i] for i in order]
+    s_sorted   = [s_keep[i] for i in order]
+    return pts_sorted, s_sorted
+
+def intersections_fixed_in(phi):
+    roots = find_roots(H_line_fixed_in, phi, t_fix_in[0], t_fix_in[1])
+    ts = np.array(roots) if roots else np.array([])
+    xs, ys = stat_in(ts) if ts.size else (np.array([]), np.array([]))
+    pts = np.column_stack([xs, ys]) if ts.size else np.empty((0,2))
+    pts_sorted, s_sorted = filter_and_sort_on_halfline(pts, phi, 'L')
+    ts_sorted = []
+    for P in pts_sorted:
+        j = np.argmin(np.hypot(xs - P[0], ys - P[1]))
+        ts_sorted.append(float(ts[j]))
+    return ts_sorted, pts_sorted, s_sorted
+
+def intersections_orbit_out(phi):
+    roots = find_roots(H_line_orbit_out, phi, t_orb_out[0], t_orb_out[1])
+    ts = np.array(roots) if roots else np.array([])
+    xs, ys = (translate_orbit(*orb_out_local(ts), phi) if ts.size else (np.array([]), np.array([])))
+    pts = np.column_stack([xs, ys]) if ts.size else np.empty((0,2))
+    pts_sorted, s_sorted = filter_and_sort_on_halfline(pts, phi, 'L')
+    ts_sorted = []
+    for P in pts_sorted:
+        j = np.argmin(np.hypot(xs - P[0], ys - P[1]))
+        ts_sorted.append(float(ts[j]))
+    return ts_sorted, pts_sorted, s_sorted
+
+def intersections_fixed_out(phi):
+    roots = find_roots(H_line_fixed_out, phi, t_fix_out[0], t_fix_out[1])
+    ts = np.array(roots) if roots else np.array([])
+    xs, ys = stat_out(ts) if ts.size else (np.array([]), np.array([]))
+    pts = np.column_stack([xs, ys]) if ts.size else np.empty((0,2))
+    pts_sorted, s_sorted = filter_and_sort_on_halfline(pts, phi, 'R')
+    ts_sorted = []
+    for P in pts_sorted:
+        j = np.argmin(np.hypot(xs - P[0], ys - P[1]))
+        ts_sorted.append(float(ts[j]))
+    return ts_sorted, pts_sorted, s_sorted
+
+def intersections_orbit_in(phi):
+    roots = find_roots(H_line_orbit_in, phi, t_orb_in[0], t_orb_in[1])
+    ts = np.array(roots) if roots else np.array([])
+    xs, ys = (translate_orbit(*orb_in_local(ts), phi) if ts.size else (np.array([]), np.array([])))
+    pts = np.column_stack([xs, ys]) if ts.size else np.empty((0,2))
+    pts_sorted, s_sorted = filter_and_sort_on_halfline(pts, phi, 'R')
+    ts_sorted = []
+    for P in pts_sorted:
+        j = np.argmin(np.hypot(xs - P[0], ys - P[1]))
+        ts_sorted.append(float(ts[j]))
+    return ts_sorted, pts_sorted, s_sorted
+
+def compute_AB_center_for_phi(phi):
+    # Left (A)
+    t_fix_L, pts_fix_L, s_fix_L = intersections_fixed_in(phi)
+    t_orb_L, pts_orb_L, s_orb_L = intersections_orbit_out(phi)
+    nA = max(0, min(len(t_fix_L), len(t_orb_L)) - 1)
+    Avals, A_outer = [], []
+    for j in range(nA):
+        t1, t2 = t_fix_L[j], t_fix_L[j+1]
+        s1, s2 = t_orb_L[j], t_orb_L[j+1]
+        P1 = P_stat_center(t1); P2 = P_stat_center(t2)
+        Q1 = P_orb_center(s1, phi); Q2 = P_orb_center(s2, phi)
+        A  = A_stat_center(t1, t2)
+        A += area_line_seg(P2, Q2)
+        A += A_orb_center(s2, s1, phi)
+        A += area_line_seg(Q1, P1)
+        Avals.append(abs(A))
+        s_avg = 0.25*(abs(s_fix_L[j]) + abs(s_fix_L[j+1]) + abs(s_orb_L[j]) + abs(s_orb_L[j+1]))
+        A_outer.append(s_avg)
+    if nA > 1:
+        order = np.argsort(-np.array(A_outer))
+        Avals = [Avals[i] for i in order]
+
+    # Right (B)
+    t_fix_R, pts_fix_R, s_fix_R = intersections_fixed_out(phi)
+    t_orb_R, pts_orb_R, s_orb_R = intersections_orbit_in(phi)
+    nB = max(0, min(len(t_fix_R), len(t_orb_R)) - 1)
+    Bvals, B_outer = [], []
+    for j in range(nB):
+        t1, t2 = t_fix_R[j], t_fix_R[j+1]
+        s1, s2 = t_orb_R[j], t_orb_R[j+1]
+        P1 = P_stat_center(t1); P2 = P_stat_center(t2)
+        Q1 = P_orb_center(s1, phi); Q2 = P_orb_center(s2, phi)
+        B  = A_stat_center(t2, t1)
+        B += area_line_seg(P1, Q1)
+        B += A_orb_center(s1, s2, phi)
+        B += area_line_seg(Q2, P2)
+        Bvals.append(abs(B))
+        s_avg = 0.25*(abs(s_fix_R[j]) + abs(s_fix_R[j+1]) + abs(s_orb_R[j]) + abs(s_orb_R[j+1]))
+        B_outer.append(s_avg)
+    if nB > 1:
+        order = np.argsort(-np.array(B_outer))
+        Bvals = [Bvals[i] for i in order]
+    return Avals, Bvals
+
+# (Re-)define C1 and sweep
+def compute_C1_center_for_phi(phi):
+    t_fix_L, pts_fix_L, s_fix_L = intersections_fixed_in(phi)
+    t_orb_L, pts_orb_L, s_orb_L = intersections_orbit_out(phi)
+    t_fix_R, pts_fix_R, s_fix_R = intersections_fixed_out(phi)
+    t_orb_R, pts_orb_R, s_orb_R = intersections_orbit_in(phi)
+    if (len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0):
+        return np.nan
+    idx_fix_L = 0
+    idx_orb_L = 0
+    idx_fix_R = len(s_fix_R) - 1
+    idx_orb_R = len(s_orb_R) - 1
+    tL = t_fix_L[idx_fix_L]; sL = t_orb_L[idx_orb_L]
+    tR = t_fix_R[idx_fix_R]; sR = t_orb_R[idx_orb_R]
+    P_stat_L = P_stat_center(tL); P_stat_R = P_stat_center(tR)
+    P_orb_L  = P_orb_center(sL, phi); P_orb_R  = P_orb_center(sR, phi)
+    A  = 0.0
+    A += area_line_seg(P_stat_L, P_orb_L)
+    A += A_orb_center(sL, sR, phi)
+    A += area_line_seg(P_orb_R, P_stat_R)
+    A += A_stat_center(tR, tL)
+    if A < 0: A = -A
+    return A
+
+def sweep_center_with_C1_and_save(deg_step=10.0, phi0_deg=169.0, suction_area=1000.0,
+                                  fn_A="areas_A_center.csv",
+                                  fn_B="areas_B_center.csv",
+                                  fn_AB="areas_AB_center.csv",
+                                  fn_ABC="areas_ABC_center.csv"):
+    num_steps = int(360/deg_step)
+    phis = [np.deg2rad(phi0_deg + deg_step*i) for i in range(num_steps)]
+    phi_rel_deg = [deg_step*i for i in range(num_steps)]
+    rawA, rawB, C1_list = [], [], []
+    for phi in phis:
+        Avals, Bvals = compute_AB_center_for_phi(phi)
+        rawA.append(Avals); rawB.append(Bvals)
+        C1_list.append(compute_C1_center_for_phi(phi))
+    shiftedA, shiftedB = [], []
+    for deg, Avals, Bvals in zip(phi_rel_deg, rawA, rawB):
+        Arow = list(Avals); Brow = list(Bvals)
+        if 180.0 <= deg < 360.0: Arow = [suction_area] + Arow
+        if 0.0   <= deg < 180.0: Brow = [suction_area] + Brow
+        shiftedA.append(Arow); shiftedB.append(Brow)
+    maxA = max((len(A) for A in shiftedA), default=0)
+    maxB = max((len(B) for B in shiftedB), default=0)
+    dfA = pd.DataFrame({"phi_deg": phi_rel_deg,
+                        **{f"A{j+1}":[ shiftedA[i][j] if j<len(shiftedA[i]) else np.nan
+                                      for i in range(num_steps)]
+                           for j in range(maxA)}})
+    dfB = pd.DataFrame({"phi_deg": phi_rel_deg,
+                        **{f"B{j+1}":[ shiftedB[i][j] if j<len(shiftedB[i]) else np.nan
+                                      for i in range(num_steps)]
+                           for j in range(maxB)}})
+    dfAB = dfA.copy()
+    for col in dfB.columns:
+        if col != "phi_deg": dfAB[col] = dfB[col]
+    dfABC = dfAB.copy(); dfABC["C1"] = C1_list
+    dfA.to_csv(fn_A, index=False); dfB.to_csv(fn_B, index=False)
+    dfAB.to_csv(fn_AB, index=False); dfABC.to_csv(fn_ABC, index=False)
+    return dfA, dfB, dfAB, dfABC
+
+dfA_c, dfB_c, dfAB_c, dfABC_c = sweep_center_with_C1_and_save(
+    deg_step=10.0, phi0_deg=169.0, suction_area=1000.0,
+    fn_A="areas_A_center.csv",
+    fn_B="areas_B_center.csv",
+    fn_AB="areas_AB_center.csv",
+    fn_ABC="areas_ABC_center.csv"
+)
