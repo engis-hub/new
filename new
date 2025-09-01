@@ -1,12 +1,26 @@
+# Endpoint extensions (to catch tangency/endpoint roots)
 EPS_FIX_DEG = 0.6
 EPS_ORB_DEG = 1.2
+
 t_fix_in  = np.deg2rad(N_fix_in_deg  + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
 t_fix_out = np.deg2rad(N_fix_out_deg + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
 t_orb_in  = np.deg2rad(N_orb_in_deg  + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
 t_orb_out = np.deg2rad(N_orb_out_deg + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
 
+# Angle sweep
+deg_step = 10.0
+num_steps = int(360 / deg_step)
+phi0_deg = 169.0
+
+# E per your correction
 E = (2*np.pi*Rg - 2*T) / 2.0
 
+# Suction placeholder
+SUCTION_AREA = 1000.0
+
+# =======================
+# Geometry (centerline method)
+# =======================
 def stat_out(t):
     x = -r*(sin(t) - t*cos(t)) + (T/2.0)*cos(t)
     y =  r*(cos(t) + t*sin(t)) + (T/2.0)*sin(t)
@@ -30,26 +44,39 @@ def orb_in_local(t):
 def translate_orbit(x, y, phi):
     return x + E*np.cos(phi), y - E*np.sin(phi)
 
-def u_dir(phi): return np.array([np.cos(phi), -np.sin(phi)])
+def u_dir(phi):
+    return np.array([np.cos(phi), -np.sin(phi)])
+
 def n_perp(phi):
     c, s = np.cos(phi), np.sin(phi)
     return np.array([s, c])
 
-# centerlines
-def stat_center(t): return -r*(sin(t) - t*cos(t)),  r*(cos(t) + t*sin(t))
-def orb_center_local(t): return  r*(sin(t) - t*cos(t)), -r*(cos(t) + t*sin(t))
-def P_stat_center(t): return np.array(stat_center(t))
-def P_orb_center(t, phi): return np.array(translate_orbit(*orb_center_local(t), phi))
+# Centerlines & analytic areas
+def P_stat_center(t):
+    return np.array([-r*(sin(t) - t*cos(t)),  r*(cos(t) + t*sin(t))])
 
-def A_stat_center(t0, t1): return (r*r/6.0) * (t1**3 - t0**3)
+def orb_center_local(t):
+    return np.array([ r*(sin(t) - t*cos(t)), -r*(cos(t) + t*sin(t)) ])
+
+def P_orb_center(t, phi):
+    X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
+    return orb_center_local(t) + np.array([X0, Y0])
+
+def A_stat_center(t0, t1):
+    return (r*r/6.0) * (t1**3 - t0**3)
+
 def A_orb_center(t0, t1, phi):
     base = (r*r/6.0) * (t1**3 - t0**3)
     def F(t): return t*np.sin(phi + t) + np.cos(phi + t)
     trans = -0.5 * E * r * (F(t1) - F(t0))
     return base + trans
 
-def area_line_seg(p, q): return 0.5 * (p[0]*q[1] - p[1]*q[0])
+def area_line_seg(p, q):
+    return 0.5 * (p[0]*q[1] - p[1]*q[0])
 
+# =======================
+# Intersections (robust)
+# =======================
 def H_line_fixed_in(t, phi):
     n = n_perp(phi); r0 =  Rg*n
     x, y = stat_in(t)
@@ -77,7 +104,8 @@ def refine_root_bisect(func, a, b, phi, itmax=60, tol=1e-12):
     for _ in range(itmax):
         m = 0.5*(lo + hi)
         fm = func(m, phi)
-        if abs(fm) <= 1e-14 or (hi - lo)/2 < tol*(1+abs(m)): return m
+        if abs(fm) <= 1e-14 or (hi - lo)/2 < tol*(1+abs(m)):
+            return m
         if flo*fm <= 0: hi, fhi = m, fm
         else:           lo, flo = m, fm
     return 0.5*(lo + hi)
@@ -86,12 +114,13 @@ def find_roots(func, phi, tmin, tmax, M=18000, tol_zero=1e-9):
     ts = np.linspace(tmin, tmax, M+1)
     Hs = func(ts, phi)
     roots = []
+
     nz = np.where(np.abs(Hs) <= tol_zero)[0]
     for idx in nz.tolist():
         roots.append(ts[idx])
+
     for i in range(M):
-        a, b = ts[i], ts[i+1]
-        fa, fb = Hs[i], Hs[i+1]
+        a, b = ts[i], ts[i+1]; fa, fb = Hs[i], Hs[i+1]
         if fa*fb < 0:
             m = refine_root_bisect(func, a, b, phi)
             if m is not None: roots.append(m)
@@ -104,181 +133,201 @@ def find_roots(func, phi, tmin, tmax, M=18000, tol_zero=1e-9):
                 right = min(tmax, b + (tmax-tmin)/M)
                 m = refine_root_bisect(func, max(a, b-(tmax-tmin)/M), right, phi)
                 if m is not None: roots.append(m)
+
     roots = sorted(set([float(np.round(r, 10)) for r in roots]))
     return roots
 
-def filter_and_sort_on_halfline(points_xy, phi, side):
+def sort_by_halfline(phi, side, xy_pts, ts):
+    if len(ts) == 0: return [], [], []
     n = n_perp(phi); u = u_dir(phi)
     r0 = ( Rg*n if side=='L' else -Rg*n )
-    s_vals = [float(np.dot(p - r0, u)) for p in points_xy]
-    if side == 'L':
-        idx = [i for i,s in enumerate(s_vals) if s > 0]
-    else:
-        idx = [i for i,s in enumerate(s_vals) if s < 0]
-    pts = [points_xy[i] for i in idx]
-    s_keep = [s_vals[i] for i in idx]
-    order = np.argsort(s_keep)
-    pts_sorted = [pts[i] for i in order]
-    s_sorted   = [s_keep[i] for i in order]
-    return pts_sorted, s_sorted
+    pts = np.array(xy_pts)
+    s_vals = (pts - r0) @ u
+    keep = np.where(s_vals > 0)[0] if side=='L' else np.where(s_vals < 0)[0]
+    ts_keep  = np.array(ts)[keep]
+    pts_keep = pts[keep]
+    s_keep   = s_vals[keep]
+    order    = np.argsort(s_keep)
+    ts_sorted  = [float(ts_keep[i]) for i in order]
+    pts_sorted = [tuple(pts_keep[i]) for i in order]
+    s_sorted   = [float(s_keep[i]) for i in order]
+    return ts_sorted, pts_sorted, s_sorted
 
 def intersections_fixed_in(phi):
-    roots = find_roots(H_line_fixed_in, phi, t_fix_in[0], t_fix_in[1])
-    ts = np.array(roots) if roots else np.array([])
-    xs, ys = stat_in(ts) if ts.size else (np.array([]), np.array([]))
-    pts = np.column_stack([xs, ys]) if ts.size else np.empty((0,2))
-    pts_sorted, s_sorted = filter_and_sort_on_halfline(pts, phi, 'L')
-    ts_sorted = []
-    for P in pts_sorted:
-        j = np.argmin(np.hypot(xs - P[0], ys - P[1]))
-        ts_sorted.append(float(ts[j]))
-    return ts_sorted, pts_sorted, s_sorted
+    ts = find_roots(H_line_fixed_in, phi, t_fix_in[0], t_fix_in[1])
+    xs, ys = stat_in(np.array(ts)) if len(ts) else (np.array([]), np.array([]))
+    return sort_by_halfline(phi, 'L', list(zip(xs, ys)) if len(ts) else [], ts)
 
 def intersections_orbit_out(phi):
-    roots = find_roots(H_line_orbit_out, phi, t_orb_out[0], t_orb_out[1])
-    ts = np.array(roots) if roots else np.array([])
-    xs, ys = (translate_orbit(*orb_out_local(ts), phi) if ts.size else (np.array([]), np.array([])))
-    pts = np.column_stack([xs, ys]) if ts.size else np.empty((0,2))
-    pts_sorted, s_sorted = filter_and_sort_on_halfline(pts, phi, 'L')
-    ts_sorted = []
-    for P in pts_sorted:
-        j = np.argmin(np.hypot(xs - P[0], ys - P[1]))
-        ts_sorted.append(float(ts[j]))
-    return ts_sorted, pts_sorted, s_sorted
+    ts = find_roots(H_line_orbit_out, phi, t_orb_out[0], t_orb_out[1])
+    if len(ts):
+        xloc, yloc = orb_out_local(np.array(ts))
+        xs, ys = translate_orbit(xloc, yloc, phi); xy = list(zip(xs, ys))
+    else:
+        xy = []
+    return sort_by_halfline(phi, 'L', xy, ts)
 
 def intersections_fixed_out(phi):
-    roots = find_roots(H_line_fixed_out, phi, t_fix_out[0], t_fix_out[1])
-    ts = np.array(roots) if roots else np.array([])
-    xs, ys = stat_out(ts) if ts.size else (np.array([]), np.array([]))
-    pts = np.column_stack([xs, ys]) if ts.size else np.empty((0,2))
-    pts_sorted, s_sorted = filter_and_sort_on_halfline(pts, phi, 'R')
-    ts_sorted = []
-    for P in pts_sorted:
-        j = np.argmin(np.hypot(xs - P[0], ys - P[1]))
-        ts_sorted.append(float(ts[j]))
-    return ts_sorted, pts_sorted, s_sorted
+    ts = find_roots(H_line_fixed_out, phi, t_fix_out[0], t_fix_out[1])
+    xs, ys = stat_out(np.array(ts)) if len(ts) else (np.array([]), np.array([]))
+    return sort_by_halfline(phi, 'R', list(zip(xs, ys)) if len(ts) else [], ts)
 
 def intersections_orbit_in(phi):
-    roots = find_roots(H_line_orbit_in, phi, t_orb_in[0], t_orb_in[1])
-    ts = np.array(roots) if roots else np.array([])
-    xs, ys = (translate_orbit(*orb_in_local(ts), phi) if ts.size else (np.array([]), np.array([])))
-    pts = np.column_stack([xs, ys]) if ts.size else np.empty((0,2))
-    pts_sorted, s_sorted = filter_and_sort_on_halfline(pts, phi, 'R')
-    ts_sorted = []
-    for P in pts_sorted:
-        j = np.argmin(np.hypot(xs - P[0], ys - P[1]))
-        ts_sorted.append(float(ts[j]))
-    return ts_sorted, pts_sorted, s_sorted
+    ts = find_roots(H_line_orbit_in, phi, t_orb_in[0], t_orb_in[1])
+    if len(ts):
+        xloc, yloc = orb_in_local(np.array(ts))
+        xs, ys = translate_orbit(xloc, yloc, phi); xy = list(zip(xs, ys))
+    else:
+        xy = []
+    return sort_by_halfline(phi, 'R', xy, ts)
 
-def compute_AB_center_for_phi(phi):
-    # Left (A)
-    t_fix_L, pts_fix_L, s_fix_L = intersections_fixed_in(phi)
-    t_orb_L, pts_orb_L, s_orb_L = intersections_orbit_out(phi)
-    nA = max(0, min(len(t_fix_L), len(t_orb_L)) - 1)
-    Avals, A_outer = [], []
-    for j in range(nA):
-        t1, t2 = t_fix_L[j], t_fix_L[j+1]
-        s1, s2 = t_orb_L[j], t_orb_L[j+1]
-        P1 = P_stat_center(t1); P2 = P_stat_center(t2)
-        Q1 = P_orb_center(s1, phi); Q2 = P_orb_center(s2, phi)
+# =======================
+# Chamber areas (centerline loops)
+# =======================
+def chambers_A_for_phi(phi):
+    t_fix, pts_fix, s_fix = intersections_fixed_in(phi)
+    t_orb, pts_orb, s_orb = intersections_orbit_out(phi)
+    n = max(0, min(len(t_fix), len(t_orb)) - 1)
+    vals, s_pairs = [], []
+    for j in range(n):
+        tf1, tf2 = t_fix[j], t_fix[j+1]
+        to1, to2 = t_orb[j], t_orb[j+1]
+        t1, t2 = (tf1, tf2) if tf1 < tf2 else (tf2, tf1)
+        s1, s2 = (to1, to2) if to1 < to2 else (to2, to1)
+        P1, P2 = P_stat_center(tf1), P_stat_center(tf2)
+        Q1, Q2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
         A  = A_stat_center(t1, t2)
         A += area_line_seg(P2, Q2)
         A += A_orb_center(s2, s1, phi)
         A += area_line_seg(Q1, P1)
-        Avals.append(abs(A))
-        s_avg = 0.25*(abs(s_fix_L[j]) + abs(s_fix_L[j+1]) + abs(s_orb_L[j]) + abs(s_orb_L[j+1]))
-        A_outer.append(s_avg)
-    if nA > 1:
-        order = np.argsort(-np.array(A_outer))
-        Avals = [Avals[i] for i in order]
+        vals.append(abs(A))
+        s_pairs.append(0.25*(abs(s_fix[j]) + abs(s_fix[j+1]) + abs(s_orb[j]) + abs(s_orb[j+1])))
+    if n > 1:
+        order = np.argsort(-np.array(s_pairs))
+        vals = [vals[i] for i in order]
+    return vals
 
-    # Right (B)
-    t_fix_R, pts_fix_R, s_fix_R = intersections_fixed_out(phi)
-    t_orb_R, pts_orb_R, s_orb_R = intersections_orbit_in(phi)
-    nB = max(0, min(len(t_fix_R), len(t_orb_R)) - 1)
-    Bvals, B_outer = [], []
-    for j in range(nB):
-        t1, t2 = t_fix_R[j], t_fix_R[j+1]
-        s1, s2 = t_orb_R[j], t_orb_R[j+1]
-        P1 = P_stat_center(t1); P2 = P_stat_center(t2)
-        Q1 = P_orb_center(s1, phi); Q2 = P_orb_center(s2, phi)
+def chambers_B_for_phi(phi):
+    t_fix, pts_fix, s_fix = intersections_fixed_out(phi)
+    t_orb, pts_orb, s_orb = intersections_orbit_in(phi)
+    n = max(0, min(len(t_fix), len(t_orb)) - 1)
+    vals, s_pairs = [], []
+    for j in range(n):
+        tf1, tf2 = t_fix[j], t_fix[j+1]
+        to1, to2 = t_orb[j], t_orb[j+1]
+        t1, t2 = (tf1, tf2) if tf1 < tf2 else (tf2, tf1)
+        s1, s2 = (to1, to2) if to1 < to2 else (to2, to1)
+        P1, P2 = P_stat_center(tf1), P_stat_center(tf2)
+        Q1, Q2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
         B  = A_stat_center(t2, t1)
         B += area_line_seg(P1, Q1)
         B += A_orb_center(s1, s2, phi)
         B += area_line_seg(Q2, P2)
-        Bvals.append(abs(B))
-        s_avg = 0.25*(abs(s_fix_R[j]) + abs(s_fix_R[j+1]) + abs(s_orb_R[j]) + abs(s_orb_R[j+1]))
-        B_outer.append(s_avg)
-    if nB > 1:
-        order = np.argsort(-np.array(B_outer))
-        Bvals = [Bvals[i] for i in order]
-    return Avals, Bvals
+        vals.append(abs(B))
+        s_pairs.append(0.25*(abs(s_fix[j]) + abs(s_fix[j+1]) + abs(s_orb[j]) + abs(s_orb[j+1])))
+    if n > 1:
+        order = np.argsort(-np.array(s_pairs))
+        vals = [vals[i] for i in order]
+    return vals
 
-# (Re-)define C1 and sweep
-def compute_C1_center_for_phi(phi):
+def chamber_C1_for_phi(phi):
     t_fix_L, pts_fix_L, s_fix_L = intersections_fixed_in(phi)
     t_orb_L, pts_orb_L, s_orb_L = intersections_orbit_out(phi)
     t_fix_R, pts_fix_R, s_fix_R = intersections_fixed_out(phi)
     t_orb_R, pts_orb_R, s_orb_R = intersections_orbit_in(phi)
-    if (len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0):
+    if len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0:
         return np.nan
-    idx_fix_L = 0
-    idx_orb_L = 0
-    idx_fix_R = len(s_fix_R) - 1
-    idx_orb_R = len(s_orb_R) - 1
-    tL = t_fix_L[idx_fix_L]; sL = t_orb_L[idx_orb_L]
-    tR = t_fix_R[idx_fix_R]; sR = t_orb_R[idx_orb_R]
-    P_stat_L = P_stat_center(tL); P_stat_R = P_stat_center(tR)
-    P_orb_L  = P_orb_center(sL, phi); P_orb_R  = P_orb_center(sR, phi)
-    A  = 0.0
-    A += area_line_seg(P_stat_L, P_orb_L)
+    tL, sL = t_fix_L[0], t_orb_L[0]
+    tR, sR = t_fix_R[-1], t_orb_R[-1]
+    P_stat_L, P_stat_R = P_stat_center(tL), P_stat_center(tR)
+    P_orb_L,  P_orb_R  = P_orb_center(sL, phi), P_orb_center(sR, phi)
+    A  = area_line_seg(P_stat_L, P_orb_L)
     A += A_orb_center(sL, sR, phi)
     A += area_line_seg(P_orb_R, P_stat_R)
     A += A_stat_center(tR, tL)
-    if A < 0: A = -A
-    return A
+    return abs(A)
 
-def sweep_center_with_C1_and_save(deg_step=10.0, phi0_deg=169.0, suction_area=1000.0,
-                                  fn_A="areas_A_center.csv",
-                                  fn_B="areas_B_center.csv",
-                                  fn_AB="areas_AB_center.csv",
-                                  fn_ABC="areas_ABC_center.csv"):
-    num_steps = int(360/deg_step)
-    phis = [np.deg2rad(phi0_deg + deg_step*i) for i in range(num_steps)]
-    phi_rel_deg = [deg_step*i for i in range(num_steps)]
-    rawA, rawB, C1_list = [], [], []
+# =======================
+# Sweep + CSV
+# =======================
+def sweep(phi0_deg=169.0, deg_step=10.0, suction_area=1000.0):
+    phis = [np.deg2rad(phi0_deg + deg_step*i) for i in range(int(360/deg_step))]
+    phi_rel_deg = [deg_step*i for i in range(int(360/deg_step))]
+    A_rows, B_rows, C1_list = [], [], []
     for phi in phis:
-        Avals, Bvals = compute_AB_center_for_phi(phi)
-        rawA.append(Avals); rawB.append(Bvals)
-        C1_list.append(compute_C1_center_for_phi(phi))
-    shiftedA, shiftedB = [], []
-    for deg, Avals, Bvals in zip(phi_rel_deg, rawA, rawB):
+        A_rows.append(chambers_A_for_phi(phi))
+        B_rows.append(chambers_B_for_phi(phi))
+        C1_list.append(chamber_C1_for_phi(phi))
+    # suction insertion
+    A_shifted, B_shifted = [], []
+    for deg, Avals, Bvals in zip(phi_rel_deg, A_rows, B_rows):
         Arow = list(Avals); Brow = list(Bvals)
-        if 180.0 <= deg < 360.0: Arow = [suction_area] + Arow
-        if 0.0   <= deg < 180.0: Brow = [suction_area] + Brow
-        shiftedA.append(Arow); shiftedB.append(Brow)
-    maxA = max((len(A) for A in shiftedA), default=0)
-    maxB = max((len(B) for B in shiftedB), default=0)
-    dfA = pd.DataFrame({"phi_deg": phi_rel_deg,
-                        **{f"A{j+1}":[ shiftedA[i][j] if j<len(shiftedA[i]) else np.nan
-                                      for i in range(num_steps)]
+        if 180.0 <= deg < 360.0:
+            Arow = [suction_area] + Arow
+        if 0.0 <= deg < 180.0:
+            Brow = [suction_area] + Brow
+        A_shifted.append(Arow); B_shifted.append(Brow)
+    return phi_rel_deg, A_shifted, B_shifted, C1_list
+
+def write_csvs(phi_deg_rel, A_rows, B_rows, C1_list,
+               fn_A="areas_A_center.csv",
+               fn_B="areas_B_center.csv",
+               fn_AB="areas_AB_center.csv",
+               fn_ABC="areas_ABC_center.csv"):
+    n = len(phi_deg_rel)
+    maxA = max((len(row) for row in A_rows), default=0)
+    maxB = max((len(row) for row in B_rows), default=0)
+    dfA = pd.DataFrame({"phi_deg": phi_deg_rel,
+                        **{f"A{j+1}":[ A_rows[i][j] if j<len(A_rows[i]) else np.nan for i in range(n) ]
                            for j in range(maxA)}})
-    dfB = pd.DataFrame({"phi_deg": phi_rel_deg,
-                        **{f"B{j+1}":[ shiftedB[i][j] if j<len(shiftedB[i]) else np.nan
-                                      for i in range(num_steps)]
+    dfB = pd.DataFrame({"phi_deg": phi_deg_rel,
+                        **{f"B{j+1}":[ B_rows[i][j] if j<len(B_rows[i]) else np.nan for i in range(n) ]
                            for j in range(maxB)}})
     dfAB = dfA.copy()
     for col in dfB.columns:
-        if col != "phi_deg": dfAB[col] = dfB[col]
-    dfABC = dfAB.copy(); dfABC["C1"] = C1_list
-    dfA.to_csv(fn_A, index=False); dfB.to_csv(fn_B, index=False)
-    dfAB.to_csv(fn_AB, index=False); dfABC.to_csv(fn_ABC, index=False)
+        if col != "phi_deg":
+            dfAB[col] = dfB[col]
+    dfABC = dfAB.copy()
+    dfABC["C1"] = C1_list
+    dfA.to_csv(fn_A, index=False)
+    dfB.to_csv(fn_B, index=False)
+    dfAB.to_csv(fn_AB, index=False)
+    dfABC.to_csv(fn_ABC, index=False)
     return dfA, dfB, dfAB, dfABC
 
-dfA_c, dfB_c, dfAB_c, dfABC_c = sweep_center_with_C1_and_save(
-    deg_step=10.0, phi0_deg=169.0, suction_area=1000.0,
-    fn_A="areas_A_center.csv",
-    fn_B="areas_B_center.csv",
-    fn_AB="areas_AB_center.csv",
-    fn_ABC="areas_ABC_center.csv"
-)
+# Diagnostics CSV: t1<t2 & s1<s2
+def write_param_order_diagnostics(phi0_deg=169.0, deg_step=10.0, fn_diag="param_order_diagnostics.csv"):
+    phis = [np.deg2rad(phi0_deg + deg_step*i) for i in range(int(360/deg_step))]
+    phi_rel_deg = [deg_step*i for i in range(int(360/deg_step))]
+    rows = []
+    for deg, phi in zip(phi_rel_deg, phis):
+        # A
+        t_fix, _, _ = intersections_fixed_in(phi)
+        t_orb, _, _ = intersections_orbit_out(phi)
+        nA = max(0, min(len(t_fix), len(t_orb)) - 1)
+        for j in range(nA):
+            tf1, tf2 = t_fix[j], t_fix[j+1]
+            to1, to2 = t_orb[j], t_orb[j+1]
+            t1, t2 = (tf1, tf2) if tf1<tf2 else (tf2, tf1)
+            s1, s2 = (to1, to2) if to1<to2 else (to2, to1)
+            rows.append({"phi_deg":deg, "side":"A", "j":j, "t1":t1, "t2":t2, "s1":s1, "s2":s2,
+                         "ok_t":bool(t1<t2), "ok_s":bool(s1<s2)})
+        # B
+        t_fix, _, _ = intersections_fixed_out(phi)
+        t_orb, _, _ = intersections_orbit_in(phi)
+        nB = max(0, min(len(t_fix), len(t_orb)) - 1)
+        for j in range(nB):
+            tf1, tf2 = t_fix[j], t_fix[j+1]
+            to1, to2 = t_orb[j], t_orb[j+1]
+            t1, t2 = (tf1, tf2) if tf1<tf2 else (tf2, tf1)
+            s1, s2 = (to1, to2) if to1<to2 else (to2, to1)
+            rows.append({"phi_deg":deg, "side":"B", "j":j, "t1":t1, "t2":t2, "s1":s1, "s2":s2,
+                         "ok_t":bool(t1<t2), "ok_s":bool(s1<s2)})
+    df = pd.DataFrame(rows)[["phi_deg","side","j","t1","t2","s1","s2","ok_t","ok_s"]]
+    df.to_csv(fn_diag, index=False)
+    return df
+
+# Run
+phi_deg_rel, A_rows, B_rows, C1_list = sweep(phi0_deg=phi0_deg, deg_step=deg_step, suction_area=SUCTION_AREA)
+dfA, dfB, dfAB, dfABC = write_csvs(phi_deg_rel, A_rows, B_rows, C1_list)
+df_diag = write_param_order_diagnostics(phi0_deg=phi0_deg, deg_step=deg_step)
