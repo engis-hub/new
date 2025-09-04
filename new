@@ -1,3 +1,20 @@
+# Build a new CSV with the requested column order:
+#   [areas only → centroids only] and append orbit center & moment origins.
+#   Columns: phi_deg, A1..Amax, B1..Bmax, C1, A1_cx,A1_cy,A2_cx,A2_cy,...,B...,C1_cx,C1_cy,
+#            orb_cx,orb_cy, rad_mx,rad_my, tan_mx,tan_my
+#
+# Notes:
+# - A/B numbering remains "outermost-first".
+# - Suction area (=1000) insertion is preserved (and centroids for that slot are NaN).
+# - Tangential moment origin follows user's formula => along (-n_perp). If CCW (+n_perp) is desired, flip the sign.
+#
+
+# Parameter ranges in degrees (user's latest)
+N_fix_in_deg  = np.array([283, 1271.5])
+N_fix_out_deg = np.array([ 86,  911.5])  
+N_orb_in_deg  = np.array([264, 1090.5])
+N_orb_out_deg = np.array([107, 1090.5])
+
 # Endpoint extensions (to catch tangency/endpoint roots)
 EPS_FIX_DEG = 0.6
 EPS_ORB_DEG = 1.2
@@ -9,14 +26,16 @@ t_orb_out = np.deg2rad(N_orb_out_deg + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
 
 # Angle sweep
 deg_step = 10.0
-num_steps = int(360 / deg_step)
 phi0_deg = 169.0
 
-# E per your correction
-E = (2*np.pi*Rg - 2*T) / 2.0
+# Orbit eccentricity
+E = (2*pi*Rg - 2*T) / 2.0
 
-# Suction placeholder
+# Suction placeholder (area only)
 SUCTION_AREA = 1000.0
+
+# Moment origins: set mirror_radius here.
+mirror_radius = 0.0  # <-- Please set your value here as needed.
 
 # =======================
 # Geometry (centerline method)
@@ -42,16 +61,16 @@ def orb_in_local(t):
     return x, y
 
 def translate_orbit(x, y, phi):
-    return x + E*np.cos(phi), y - E*np.sin(phi)
+    return x + E*cos(phi), y - E*sin(phi)
 
 def u_dir(phi):
-    return np.array([np.cos(phi), -np.sin(phi)])
+    return np.array([cos(phi), -sin(phi)])
 
 def n_perp(phi):
-    c, s = np.cos(phi), np.sin(phi)
+    c, s = cos(phi), sin(phi)
     return np.array([s, c])
 
-# Centerlines & analytic areas
+# Centerlines
 def P_stat_center(t):
     return np.array([-r*(sin(t) - t*cos(t)),  r*(cos(t) + t*sin(t))])
 
@@ -59,15 +78,16 @@ def orb_center_local(t):
     return np.array([ r*(sin(t) - t*cos(t)), -r*(cos(t) + t*sin(t)) ])
 
 def P_orb_center(t, phi):
-    X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
+    X0, Y0 = E*cos(phi), -E*sin(phi)
     return orb_center_local(t) + np.array([X0, Y0])
 
+# Analytic areas
 def A_stat_center(t0, t1):
     return (r*r/6.0) * (t1**3 - t0**3)
 
 def A_orb_center(t0, t1, phi):
     base = (r*r/6.0) * (t1**3 - t0**3)
-    def F(t): return t*np.sin(phi + t) + np.cos(phi + t)
+    def F(t): return t*sin(phi + t) + cos(phi + t)
     trans = -0.5 * E * r * (F(t1) - F(t0))
     return base + trans
 
@@ -75,7 +95,7 @@ def area_line_seg(p, q):
     return 0.5 * (p[0]*q[1] - p[1]*q[0])
 
 # =======================
-# Intersections (robust)
+# Intersections
 # =======================
 def H_line_fixed_in(t, phi):
     n = n_perp(phi); r0 =  Rg*n
@@ -138,19 +158,25 @@ def find_roots(func, phi, tmin, tmax, M=18000, tol_zero=1e-9):
     return roots
 
 def sort_by_halfline(phi, side, xy_pts, ts):
+    """Return intersections sorted inner->outer along the half-line.
+       L: keep s>0, sort ascending (0->+∞); R: keep s<0, sort by -s ascending (0->-∞)."""
     if len(ts) == 0: return [], [], []
     n = n_perp(phi); u = u_dir(phi)
     r0 = ( Rg*n if side=='L' else -Rg*n )
     pts = np.array(xy_pts)
     s_vals = (pts - r0) @ u
-    keep = np.where(s_vals > 0)[0] if side=='L' else np.where(s_vals < 0)[0]
-    ts_keep  = np.array(ts)[keep]
-    pts_keep = pts[keep]
-    s_keep   = s_vals[keep]
-    order    = np.argsort(s_keep)
-    ts_sorted  = [float(ts_keep[i]) for i in order]
-    pts_sorted = [tuple(pts_keep[i]) for i in order]
-    s_sorted   = [float(s_keep[i]) for i in order]
+    if side=='L':
+        keep_idx = np.where(s_vals > 0)[0]
+        order = np.argsort(s_vals[keep_idx])      # inner -> outer
+    else:
+        keep_idx = np.where(s_vals < 0)[0]
+        order = np.argsort(-s_vals[keep_idx])     # inner -> outer
+    ts_keep  = np.array(ts)[keep_idx][order]
+    pts_keep = pts[keep_idx][order]
+    s_keep   = s_vals[keep_idx][order]
+    ts_sorted  = [float(ts_keep[i]) for i in range(len(order))]
+    pts_sorted = [tuple(pts_keep[i]) for i in range(len(order))]
+    s_sorted   = [float(s_keep[i]) for i in range(len(order))]
     return ts_sorted, pts_sorted, s_sorted
 
 def intersections_fixed_in(phi):
@@ -182,152 +208,183 @@ def intersections_orbit_in(phi):
     return sort_by_halfline(phi, 'R', xy, ts)
 
 # =======================
-# Chamber areas (centerline loops)
+# (1/3)-form primitives for centroid integrals (as in user's code)
 # =======================
-def chambers_A_for_phi(phi):
-    t_fix, pts_fix, s_fix = intersections_fixed_in(phi)
-    t_orb, pts_orb, s_orb = intersections_orbit_out(phi)
+def F_stat_Mx(t):
+    return (r**3/3.0)*( t**3*sin(t) + 4.0*t**2*cos(t) - 8.0*t*sin(t) - 8.0*cos(t) )
+def F_stat_My(t):
+    return (r**3/3.0)*( -t**3*cos(t) + 4.0*t**2*sin(t) + 8.0*t*cos(t) - 8.0*sin(t) )
+def Mx_stat_center(t0, t1): return F_stat_Mx(t1) - F_stat_Mx(t0)
+def My_stat_center(t0, t1): return F_stat_My(t1) - F_stat_My(t0)
+
+def F_stat_S1(t):
+    return (r**2)*((t**3)/6.0 + (t**2)*sin(2*t)/4.0 + t*cos(2*t)/2.0 - sin(2*t)/4.0)
+def F_stat_S2(t):
+    return (r**2)*(-(t**3)/6.0 + (t**2)*sin(2*t)/4.0 + t*cos(2*t)/2.0 - sin(2*t)/4.0)
+def S1_stat(t0, t1): return F_stat_S1(t1) - F_stat_S1(t0)
+def S2_stat(t0, t1): return F_stat_S2(t1) - F_stat_S2(t0)
+
+# Orbit (global) by translation of local curve: (x,y) = ( -x_stat, -y_stat ) + (X0,Y0)
+def Mx_orb_center(t0, t1, phi):
+    X0, Y0 = E*cos(phi), -E*sin(phi)
+    p = P_stat_center(t0); q = P_stat_center(t1)
+    dx = q[0] - p[0]; dy = q[1] - p[1]
+    dx2 = q[0]**2 - p[0]**2
+    return (- Mx_stat_center(t0, t1)
+            + (2*X0*S1_stat(t0,t1) - X0*S2_stat(t0,t1) - 0.5*Y0*dx2 - (X0**2)*dy + X0*Y0*dx)/3.0)
+
+def My_orb_center(t0, t1, phi):
+    X0, Y0 = E*cos(phi), -E*sin(phi)
+    p = P_stat_center(t0); q = P_stat_center(t1)
+    dx = q[0] - p[0]; dy = q[1] - p[1]
+    dy2 = q[1]**2 - p[1]**2
+    return (- My_stat_center(t0, t1)
+            + (0.5*X0*dy2 + Y0*S1_stat(t0,t1) - X0*Y0*dy - 2*Y0*S2_stat(t0,t1) + (Y0**2)*dx)/3.0)
+
+# Lines (polygon centroid formula)
+def Mx_line_seg(p, q):
+    return ( (p[0] + q[0]) / 3.0 ) * area_line_seg(p, q)
+def My_line_seg(p, q):
+    return ( (p[1] + q[1]) / 3.0 ) * area_line_seg(p, q)
+
+# =======================
+# Chambers: area & centroid, with outermost-first ordering
+# =======================
+def chambers_A_props_for_phi(phi):
+    t_fix, _, s_fix = intersections_fixed_in(phi)
+    t_orb, _, s_orb = intersections_orbit_out(phi)
     n = max(0, min(len(t_fix), len(t_orb)) - 1)
-    vals, s_pairs = [], []
+    items = []
     for j in range(n):
         tf1, tf2 = t_fix[j], t_fix[j+1]
         to1, to2 = t_orb[j], t_orb[j+1]
-        t1, t2 = (tf1, tf2) if tf1 < tf2 else (tf2, tf1)
-        s1, s2 = (to1, to2) if to1 < to2 else (to2, to1)
-        P1, P2 = P_stat_center(tf1), P_stat_center(tf2)
-        Q1, Q2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
-        A  = A_stat_center(t1, t2)
-        A += area_line_seg(P2, Q2)
-        A += A_orb_center(s2, s1, phi)
-        A += area_line_seg(Q1, P1)
-        vals.append(abs(A))
-        s_pairs.append(0.25*(abs(s_fix[j]) + abs(s_fix[j+1]) + abs(s_orb[j]) + abs(s_orb[j+1])))
-    if n > 1:
-        order = np.argsort(-np.array(s_pairs))
-        vals = [vals[i] for i in order]
-    return vals
+        PF1, PF2 = P_stat_center(tf1), P_stat_center(tf2)
+        PO1, PO2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
+        # CCW loop: po1->pf1 (line), pf1->pf2 (stat), pf2->po2 (line), po2->po1 (orb reverse)
+        A  = area_line_seg(PO1, PF1) + A_stat_center(tf1, tf2) + area_line_seg(PF2, PO2) + A_orb_center(to2, to1, phi)
+        Mx = Mx_line_seg(PO1, PF1)   + Mx_stat_center(tf1, tf2) + Mx_line_seg(PF2, PO2)   + Mx_orb_center(to2, to1, phi)
+        My = My_line_seg(PO1, PF1)   + My_stat_center(tf1, tf2) + My_line_seg(PF2, PO2)   + My_orb_center(to2, to1, phi)
+        s_avg = 0.25*(abs(s_fix[j]) + abs(s_fix[j+1]) + abs(s_orb[j]) + abs(s_orb[j+1]))
+        items.append((abs(A), (Mx/A if abs(A)>=1e-12 else np.nan), (My/A if abs(A)>=1e-12 else np.nan), s_avg))
+    # outermost-first
+    items.sort(key=lambda x: -x[3])
+    return [(a,cx,cy) for (a,cx,cy,_) in items]
 
-def chambers_B_for_phi(phi):
-    t_fix, pts_fix, s_fix = intersections_fixed_out(phi)
-    t_orb, pts_orb, s_orb = intersections_orbit_in(phi)
+def chambers_B_props_for_phi(phi):
+    t_fix, _, s_fix = intersections_fixed_out(phi)
+    t_orb, _, s_orb = intersections_orbit_in(phi)
     n = max(0, min(len(t_fix), len(t_orb)) - 1)
-    vals, s_pairs = [], []
+    items = []
     for j in range(n):
         tf1, tf2 = t_fix[j], t_fix[j+1]
         to1, to2 = t_orb[j], t_orb[j+1]
-        t1, t2 = (tf1, tf2) if tf1 < tf2 else (tf2, tf1)
-        s1, s2 = (to1, to2) if to1 < to2 else (to2, to1)
-        P1, P2 = P_stat_center(tf1), P_stat_center(tf2)
-        Q1, Q2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
-        B  = A_stat_center(t2, t1)
-        B += area_line_seg(P1, Q1)
-        B += A_orb_center(s1, s2, phi)
-        B += area_line_seg(Q2, P2)
-        vals.append(abs(B))
-        s_pairs.append(0.25*(abs(s_fix[j]) + abs(s_fix[j+1]) + abs(s_orb[j]) + abs(s_orb[j+1])))
-    if n > 1:
-        order = np.argsort(-np.array(s_pairs))
-        vals = [vals[i] for i in order]
-    return vals
+        PF1, PF2 = P_stat_center(tf1), P_stat_center(tf2)
+        PO1, PO2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
+        # Geometric B-loop (CW), magnitude only for output
+        A  = area_line_seg(PO1, PF1) + A_stat_center(tf1, tf2) + area_line_seg(PF2, PO2) + A_orb_center(to2, to1, phi)
+        Mx = Mx_line_seg(PO1, PF1)   + Mx_stat_center(tf1, tf2) + Mx_line_seg(PF2, PO2)   + Mx_orb_center(to2, to1, phi)
+        My = My_line_seg(PO1, PF1)   + My_stat_center(tf1, tf2) + My_line_seg(PF2, PO2)   + My_orb_center(to2, to1, phi)
+        s_avg = 0.25*(abs(s_fix[j]) + abs(s_fix[j+1]) + abs(s_orb[j]) + abs(s_orb[j+1]))
+        items.append((abs(A), (Mx/A if abs(A)>=1e-12 else np.nan), (My/A if abs(A)>=1e-12 else np.nan), s_avg))
+    # outermost-first
+    items.sort(key=lambda x: -x[3])
+    return [(a,cx,cy) for (a,cx,cy,_) in items]
 
-def chamber_C1_for_phi(phi):
-    t_fix_L, pts_fix_L, s_fix_L = intersections_fixed_in(phi)
-    t_orb_L, pts_orb_L, s_orb_L = intersections_orbit_out(phi)
-    t_fix_R, pts_fix_R, s_fix_R = intersections_fixed_out(phi)
-    t_orb_R, pts_orb_R, s_orb_R = intersections_orbit_in(phi)
+def chamber_C1_props_for_phi(phi):
+    t_fix_L, _, _ = intersections_fixed_in(phi)
+    t_orb_L, _, _ = intersections_orbit_out(phi)
+    t_fix_R, _, _ = intersections_fixed_out(phi)
+    t_orb_R, _, _ = intersections_orbit_in(phi)
     if len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0:
-        return np.nan
-    tL, sL = t_fix_L[0], t_orb_L[0]
-    tR, sR = t_fix_R[-1], t_orb_R[-1]
+        return np.nan, np.nan, np.nan
+    tL, sL = t_fix_L[0],  t_orb_L[0]       # inner on L
+    tR, sR = t_fix_R[-1], t_orb_R[-1]      # inner on R
     P_stat_L, P_stat_R = P_stat_center(tL), P_stat_center(tR)
     P_orb_L,  P_orb_R  = P_orb_center(sL, phi), P_orb_center(sR, phi)
-    A  = area_line_seg(P_stat_L, P_orb_L)
-    A += A_orb_center(sL, sR, phi)
-    A += area_line_seg(P_orb_R, P_stat_R)
-    A += A_stat_center(tR, tL)
-    return abs(A)
+    A  = area_line_seg(P_stat_L, P_orb_L) + A_orb_center(sL, sR, phi) + area_line_seg(P_orb_R, P_stat_R) + A_stat_center(tR, tL)
+    Mx = Mx_line_seg(P_stat_L, P_orb_L) + Mx_orb_center(sL, sR, phi) + Mx_line_seg(P_orb_R, P_stat_R) + Mx_stat_center(tR, tL)
+    My = My_line_seg(P_stat_L, P_orb_L) + My_orb_center(sL, sR, phi) + My_line_seg(P_orb_R, P_stat_R) + My_stat_center(tR, tL)
+    return (abs(A), (Mx/A if abs(A)>=1e-12 else np.nan), (My/A if abs(A)>=1e-12 else np.nan))
 
 # =======================
-# Sweep + CSV
+# Sweep and build wide CSV in requested order
 # =======================
-def sweep(phi0_deg=169.0, deg_step=10.0, suction_area=1000.0):
+def sweep_and_write(filename="/mnt/data/areas_centroids_ordered.csv", mirror_radius=0.0):
     phis = [np.deg2rad(phi0_deg + deg_step*i) for i in range(int(360/deg_step))]
-    phi_rel_deg = [deg_step*i for i in range(int(360/deg_step))]
-    A_rows, B_rows, C1_list = [], [], []
+    phi_deg_rel = [deg_step*i for i in range(int(360/deg_step))]
+
+    A_list, B_list = [], []
+    C1_area, C1_cx, C1_cy = [], [], []
+
+    # For final columns: orbit center & moment origins
+    orb_cx, orb_cy = [], []
+    rad_mx, rad_my = [], []
+    tan_mx, tan_my = [], []
+
     for phi in phis:
-        A_rows.append(chambers_A_for_phi(phi))
-        B_rows.append(chambers_B_for_phi(phi))
-        C1_list.append(chamber_C1_for_phi(phi))
-    # suction insertion
-    A_shifted, B_shifted = [], []
-    for deg, Avals, Bvals in zip(phi_rel_deg, A_rows, B_rows):
-        Arow = list(Avals); Brow = list(Bvals)
-        if 180.0 <= deg < 360.0:
-            Arow = [suction_area] + Arow
-        if 0.0 <= deg < 180.0:
-            Brow = [suction_area] + Brow
-        A_shifted.append(Arow); B_shifted.append(Brow)
-    return phi_rel_deg, A_shifted, B_shifted, C1_list
+        A_pack = chambers_A_props_for_phi(phi)  # list of (area,cx,cy), outermost-first
+        B_pack = chambers_B_props_for_phi(phi)
+        c1a, c1x, c1y = chamber_C1_props_for_phi(phi)
 
-def write_csvs(phi_deg_rel, A_rows, B_rows, C1_list,
-               fn_A="areas_A_center.csv",
-               fn_B="areas_B_center.csv",
-               fn_AB="areas_AB_center.csv",
-               fn_ABC="areas_ABC_center.csv"):
-    n = len(phi_deg_rel)
-    maxA = max((len(row) for row in A_rows), default=0)
-    maxB = max((len(row) for row in B_rows), default=0)
-    dfA = pd.DataFrame({"phi_deg": phi_deg_rel,
-                        **{f"A{j+1}":[ A_rows[i][j] if j<len(A_rows[i]) else np.nan for i in range(n) ]
-                           for j in range(maxA)}})
-    dfB = pd.DataFrame({"phi_deg": phi_deg_rel,
-                        **{f"B{j+1}":[ B_rows[i][j] if j<len(B_rows[i]) else np.nan for i in range(n) ]
-                           for j in range(maxB)}})
-    dfAB = dfA.copy()
-    for col in dfB.columns:
-        if col != "phi_deg":
-            dfAB[col] = dfB[col]
-    dfABC = dfAB.copy()
-    dfABC["C1"] = C1_list
-    dfA.to_csv(fn_A, index=False)
-    dfB.to_csv(fn_B, index=False)
-    dfAB.to_csv(fn_AB, index=False)
-    dfABC.to_csv(fn_ABC, index=False)
-    return dfA, dfB, dfAB, dfABC
+        # suction insertion (areas AND centroids must shift together horizontally)
+        deg_rel = (phi - np.deg2rad(phi0_deg)) * 180.0 / np.pi
+        # Normalize numerical noise
+        deg_rel = (round(deg_rel/deg_step) * deg_step) % 360.0
 
-# Diagnostics CSV: t1<t2 & s1<s2
-def write_param_order_diagnostics(phi0_deg=169.0, deg_step=10.0, fn_diag="param_order_diagnostics.csv"):
-    phis = [np.deg2rad(phi0_deg + deg_step*i) for i in range(int(360/deg_step))]
-    phi_rel_deg = [deg_step*i for i in range(int(360/deg_step))]
-    rows = []
-    for deg, phi in zip(phi_rel_deg, phis):
-        # A
-        t_fix, _, _ = intersections_fixed_in(phi)
-        t_orb, _, _ = intersections_orbit_out(phi)
-        nA = max(0, min(len(t_fix), len(t_orb)) - 1)
-        for j in range(nA):
-            tf1, tf2 = t_fix[j], t_fix[j+1]
-            to1, to2 = t_orb[j], t_orb[j+1]
-            t1, t2 = (tf1, tf2) if tf1<tf2 else (tf2, tf1)
-            s1, s2 = (to1, to2) if to1<to2 else (to2, to1)
-            rows.append({"phi_deg":deg, "side":"A", "j":j, "t1":t1, "t2":t2, "s1":s1, "s2":s2,
-                         "ok_t":bool(t1<t2), "ok_s":bool(s1<s2)})
-        # B
-        t_fix, _, _ = intersections_fixed_out(phi)
-        t_orb, _, _ = intersections_orbit_in(phi)
-        nB = max(0, min(len(t_fix), len(t_orb)) - 1)
-        for j in range(nB):
-            tf1, tf2 = t_fix[j], t_fix[j+1]
-            to1, to2 = t_orb[j], t_orb[j+1]
-            t1, t2 = (tf1, tf2) if tf1<tf2 else (tf2, tf1)
-            s1, s2 = (to1, to2) if to1<to2 else (to2, to1)
-            rows.append({"phi_deg":deg, "side":"B", "j":j, "t1":t1, "t2":t2, "s1":s1, "s2":s2,
-                         "ok_t":bool(t1<t2), "ok_s":bool(s1<s2)})
-    df = pd.DataFrame(rows)[["phi_deg","side","j","t1","t2","s1","s2","ok_t","ok_s"]]
-    df.to_csv(fn_diag, index=False)
+        if 180.0 <= deg_rel < 360.0:
+            A_pack = [(SUCTION_AREA, np.nan, np.nan)] + A_pack
+        if 0.0 <= deg_rel < 180.0:
+            B_pack = [(SUCTION_AREA, np.nan, np.nan)] + B_pack
+
+        A_list.append(A_pack)
+        B_list.append(B_pack)
+        C1_area.append(c1a); C1_cx.append(c1x); C1_cy.append(c1y)
+
+        # orbit center and moment origins
+        ocx = E*cos(phi); ocy = -E*sin(phi)
+        rdx = (E + mirror_radius)*cos(phi); rdy = -(E + mirror_radius)*sin(phi)
+        # tangential per user's formula: +cos(phi+pi/2) in x, and -sin(phi+pi/2) in y
+        tnx = E*cos(phi) + mirror_radius*cos(phi + np.pi/2.0)
+        tny = -E*sin(phi) - mirror_radius*sin(phi + np.pi/2.0)
+        orb_cx.append(ocx); orb_cy.append(ocy)
+        rad_mx.append(rdx);  rad_my.append(rdy)
+        tan_mx.append(tnx);  tan_my.append(tny)
+
+    # Determine max counts
+    maxA = max((len(row) for row in A_list), default=0)
+    maxB = max((len(row) for row in B_list), default=0)
+
+    # Build column-wise dict in requested order: areas first, then centroids
+    data = {"phi_deg": phi_deg_rel}
+
+    # Areas: A1.., B1.., C1
+    for j in range(maxA):
+        data[f"A{j+1}"] = [A_list[i][j][0] if j < len(A_list[i]) else np.nan for i in range(len(phis))]
+    for j in range(maxB):
+        data[f"B{j+1}"] = [B_list[i][j][0] if j < len(B_list[i]) else np.nan for i in range(len(phis))]
+    data["C1"] = C1_area
+
+    # Centroids (areas already done): A1_cx, A1_cy, A2_cx, A2_cy, ..., B..., C1_cx, C1_cy
+    for j in range(maxA):
+        data[f"A{j+1}_cx"] = [A_list[i][j][1] if j < len(A_list[i]) else np.nan for i in range(len(phis))]
+        data[f"A{j+1}_cy"] = [A_list[i][j][2] if j < len(A_list[i]) else np.nan for i in range(len(phis))]
+    for j in range(maxB):
+        data[f"B{j+1}_cx"] = [B_list[i][j][1] if j < len(B_list[i]) else np.nan for i in range(len(phis))]
+        data[f"B{j+1}_cy"] = [B_list[i][j][2] if j < len(B_list[i]) else np.nan for i in range(len(phis))]
+    data["C1_cx"] = C1_cx
+    data["C1_cy"] = C1_cy
+
+    # Append orbit center & moment origin columns
+    data["orb_center_x"] = orb_cx
+    data["orb_center_y"] = orb_cy
+    data["rad_moment_x"] = rad_mx
+    data["rad_moment_y"] = rad_my
+    data["tan_moment_x"] = tan_mx
+    data["tan_moment_y"] = tan_my
+
+    df = pd.DataFrame(data)
+    df.to_csv(filename, index=False)
     return df
 
-# Run
-phi_deg_rel, A_rows, B_rows, C1_list = sweep(phi0_deg=phi0_deg, deg_step=deg_step, suction_area=SUCTION_AREA)
-dfA, dfB, dfAB, dfABC = write_csvs(phi_deg_rel, A_rows, B_rows, C1_list)
-df_diag = write_param_order_diagnostics(phi0_deg=phi0_deg, deg_step=deg_step)
+df_out = sweep_and_write(filename="/mnt/data/areas_centroids_ordered.csv", mirror_radius=mirror_radius)
+"/mnt/data/areas_centroids_ordered.csv", df_out.head(5)
