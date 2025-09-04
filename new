@@ -7,13 +7,7 @@
 # - A/B numbering remains "outermost-first".
 # - Suction area (=1000) insertion is preserved (and centroids for that slot are NaN).
 # - Tangential moment origin follows user's formula => along (-n_perp). If CCW (+n_perp) is desired, flip the sign.
-#
 
-# Parameter ranges in degrees (user's latest)
-N_fix_in_deg  = np.array([283, 1271.5])
-N_fix_out_deg = np.array([ 86,  911.5])  
-N_orb_in_deg  = np.array([264, 1090.5])
-N_orb_out_deg = np.array([107, 1090.5])
 
 # Endpoint extensions (to catch tangency/endpoint roots)
 EPS_FIX_DEG = 0.6
