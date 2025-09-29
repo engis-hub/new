@@ -1,102 +1,145 @@
+r'''# -*- coding: utf-8 -*-
+"""
+R32 area constancy with split EPS handling:
+- EPS is used ONLY to widen search intervals for intersection root finding.
+- All area computations (centerline chambers A/B/C1 and suction) clamp t-values to RAW winding domains.
+- Uses user's new R32 patch & metadata (unused items kept for clarity).
+Outputs:
+  CSV: /mnt/data/areas_R32_constancy_epssplit.csv
+  PNG: /mnt/data/area_constancy_R32_epssplit.png
+"""
+
 import numpy as np
 import pandas as pd
 from numpy import sin, cos, pi
+import matplotlib.pyplot as plt
 
-# ========= Variants =========
-VARIANTS = {
-    "R290": dict(
-        ENFORCE_CONST=False
-    ),
-    "R32": dict(
-        ENFORCE_CONST=True
-    ),
-}
+# ===== R32 parameters (as provided) =====
+Rg = 
+T  = 
+r  = Rg
+phi0_deg = 
+E  = (2*pi*Rg - 2*T) / 2.0
 
-# Global physicals
-GAMMA        = 1.４５
-P_SUCTION_MP = 1.0
-h_wrap       = 34.0
+# Winding angles (RAW, no EPS for area)
+N_fix_in_deg_raw  = np.array([])
+N_fix_out_deg_raw = np.array([])
+N_orb_in_deg_raw  = np.array([])
+N_orb_out_deg_raw = np.array([])
 
-# Steps
-DEG_STEP_MAIN = 10.0
+t_fix_in_raw  = np.deg2rad(N_fix_in_deg_raw )
+t_fix_out_raw = np.deg2rad(N_fix_out_deg_raw)
+t_orb_in_raw  = np.deg2rad(N_orb_in_deg_raw )
+t_orb_out_raw = np.deg2rad(N_orb_out_deg_raw)
+
+# EPS-extended for root finding only
 EPS_FIX_DEG = 0.6
 EPS_ORB_DEG = 1.2
+t_fix_in_eps  = np.deg2rad(N_fix_in_deg_raw  + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
+t_fix_out_eps = np.deg2rad(N_fix_out_deg_raw + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
+t_orb_in_eps  = np.deg2rad(N_orb_in_deg_raw  + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
+t_orb_out_eps = np.deg2rad(N_orb_out_deg_raw + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
 
-# ========= Geometry helpers =========
+# Milling patch (updated R32)
+PATCH_AREA = 350.1413
+PATCH_CX   = -44.8444
+PATCH_CY   =  16.2285
+
+# Unused (kept for reference)
+GAMMA = 1.45
+mirror_radius = 58.0
+h_wrap = 35.2
+h_mirror = 8.5
+h_main_bearing = 31.5
+seal_radius = 57.6/2.0
+p_m_point = np.array([0.2321, 5.2002])
+P_seal_point = np.array([-0.9496, 4.0354])
+
+# Sweep
+deg_step = 10.0
+num_steps = int(360/deg_step)
+
+# ===== Helpers =====
 def u_dir(phi):  return np.array([np.cos(phi), -np.sin(phi)])
 def n_perp(phi): return np.array([np.sin(phi),  np.cos(phi)])
 
-def P_stat_center(r, t):
+def translate_orbit(x, y, phi):
+    return x + E*np.cos(phi), y - E*np.sin(phi)
+
+def P_stat_center(t):
     return np.array([-r*(sin(t) - t*cos(t)),  r*(cos(t) + t*sin(t))])
-def P_orb_center(r, E, t, phi):
+def P_orb_center(t, phi):
     X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
     return np.array([ r*(sin(t) - t*cos(t)) + X0, -r*(cos(t) + t*sin(t)) + Y0 ])
 
-def stat_out(r, T, t):
+def stat_out(t):
     x = -r*(sin(t) - t*cos(t)) + (T/2.0)*cos(t)
     y =  r*(cos(t) + t*sin(t)) + (T/2.0)*sin(t)
     return x, y
-def stat_in(r, T, t):
+def stat_in(t):
     x = -r*(sin(t) - t*cos(t)) - (T/2.0)*cos(t)
     y =  r*(cos(t) + t*sin(t)) - (T/2.0)*sin(t)
     return x, y
-def orb_out_local(r, T, t):
+def orb_out_local(t):
     x =  r*(sin(t) - t*cos(t)) - (T/2.0)*cos(t)
     y = -r*(cos(t) + t*sin(t)) - (T/2.0)*sin(t)
     return x, y
-def orb_in_local(r, T, t):
+def orb_in_local(t):
     x =  r*(sin(t) - t*cos(t)) + (T/2.0)*cos(t)
     y = -r*(cos(t) + t*sin(t)) + (T/2.0)*sin(t)
     return x, y
-def translate_orbit(E, x, y, phi):
-    return x + E*np.cos(phi), y - E*np.sin(phi)
 
-# ========= Intersection machinery =========
-def H_line_fixed_in(r, T, Rg, E, t, phi):
-    n = n_perp(phi); r0 =  Rg*n
-    x, y = stat_in(r,T,t);  return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
-def H_line_fixed_out(r, T, Rg, E, t, phi):
-    n = n_perp(phi); r0 = -Rg*n
-    x, y = stat_out(r,T,t); return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
-def H_line_orbit_out(r, T, Rg, E, t, phi):
-    n = n_perp(phi); r0 =  Rg*n
-    x, y = translate_orbit(E, *orb_out_local(r,T,t), phi); return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
-def H_line_orbit_in(r, T, Rg, E, t, phi):
-    n = n_perp(phi); r0 = -Rg*n
-    x, y = translate_orbit(E, *orb_in_local(r,T,t), phi);  return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+# Clamp to RAW domain
+def clamp(t, tmin, tmax):
+    return max(tmin, min(tmax, t))
 
-def _bisect(func, a, b, args, itmax=60, tol=1e-12):
-    fa, fb = func(a, *args), func(b, *args)
+# ===== Intersections (use EPS intervals) =====
+def H_line_fixed_in(t, phi):
+    n = n_perp(phi); r0 =  Rg*n
+    x, y = stat_in(t);  return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+def H_line_fixed_out(t, phi):
+    n = n_perp(phi); r0 = -Rg*n
+    x, y = stat_out(t); return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+def H_line_orbit_out(t, phi):
+    n = n_perp(phi); r0 =  Rg*n
+    x, y = translate_orbit(*orb_out_local(t), phi); return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+def H_line_orbit_in(t, phi):
+    n = n_perp(phi); r0 = -Rg*n
+    x, y = translate_orbit(*orb_in_local(t), phi);  return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+
+def _bisect(func, a, b, phi, itmax=60, tol=1e-12):
+    fa, fb = func(a, phi), func(b, phi)
     if fa*fb > 0: return None
     lo, hi, flo, fhi = a, b, fa, fb
     for _ in range(itmax):
-        m = 0.5*(lo + hi); fm = func(m, *args)
+        m = 0.5*(lo + hi)
+        fm = func(m, phi)
         if abs(fm) <= 1e-14 or (hi-lo)/2 < tol*(1+abs(m)): return m
         if flo*fm <= 0: hi, fhi = m, fm
         else:           lo, flo = m, fm
     return 0.5*(lo + hi)
 
-def find_roots(func, args, tmin, tmax, M=20000, tol_zero=1e-9):
+def find_roots(func, phi, tmin, tmax, M=22000, tol_zero=1e-9):
     ts = np.linspace(tmin, tmax, M+1)
-    Hs = func(ts, *args)
+    Hs = func(ts, phi)
     roots = []
     nz = np.where(np.abs(Hs) <= tol_zero)[0].tolist()
     for i in nz: roots.append(ts[i])
     for i in range(M):
         a, b, fa, fb = ts[i], ts[i+1], Hs[i], Hs[i+1]
         if fa*fb < 0:
-            m = _bisect(func, a, b, args);  roots += ([] if m is None else [m])
+            m = _bisect(func, a, b, phi);  roots += ([] if m is None else [m])
         else:
             if abs(fa) < 10*tol_zero:
                 left = max(tmin, a - (tmax-tmin)/M)
-                m = _bisect(func, left, min(b, a+(tmax-tmin)/M), args);  roots += ([] if m is None else [m])
+                m = _bisect(func, left, min(b, a+(tmax-tmin)/M), phi);  roots += ([] if m is None else [m])
             if abs(fb) < 10*tol_zero:
                 right = min(tmax, b + (tmax-tmin)/M)
-                m = _bisect(func, max(a, b-(tmax-tmin)/M), right, args); roots += ([] if m else [])
+                m = _bisect(func, max(a, b-(tmax-tmin)/M), right, phi); roots += ([] if m else [])
     roots = sorted(set([float(np.round(r, 10)) for r in roots]))
     return roots
 
-def sort_by_halfline(r, T, Rg, E, phi, side, xy_pts, ts):
+def sort_by_halfline(phi, side, xy_pts, ts):
     if len(ts) == 0: return [], [], []
     n = n_perp(phi); u = u_dir(phi)
     r0 = ( Rg*n if side=='L' else -Rg*n )
@@ -108,37 +151,74 @@ def sort_by_halfline(r, T, Rg, E, phi, side, xy_pts, ts):
         keep_idx = np.where(s_vals < 0)[0]; order = np.argsort(-s_vals[keep_idx])
     ts_keep  = np.array(ts)[keep_idx][order]
     pts_keep = pts[keep_idx][order]
-    ts_sorted  = [float(ts_keep[i]) for i in range(len(order))]
-    pts_sorted = [tuple(pts_keep[i]) for i in range(len(order))]
-    s_sorted   = list((pts_keep - r0) @ u)
-    return ts_sorted, pts_sorted, s_sorted
+    return [float(x) for x in ts_keep], [tuple(p) for p in pts_keep], list((pts_keep - r0) @ u)
 
-def intersections_fixed_in(r, T, Rg, E, phi, t_fix_in):
-    ts = find_roots(lambda t,*aa: H_line_fixed_in(r,T,Rg,E,t,*aa), (phi,), t_fix_in[0], t_fix_in[1])
-    xs, ys = stat_in(r,T,np.array(ts)) if len(ts) else (np.array([]), np.array([]))
-    return sort_by_halfline(r,T,Rg,E,phi,'L', list(zip(xs, ys)) if len(ts) else [], ts)
-def intersections_orbit_out(r, T, Rg, E, phi, t_orb_out):
-    ts = find_roots(lambda t,*aa: H_line_orbit_out(r,T,Rg,E,t,*aa), (phi,), t_orb_out[0], t_orb_out[1])
+def intersections_fixed_in(phi):
+    ts = find_roots(H_line_fixed_in, phi, t_fix_in_eps[0], t_fix_in_eps[1])
+    xs, ys = stat_in(np.array(ts)) if len(ts) else (np.array([]), np.array([]))
+    return sort_by_halfline(phi, 'L', list(zip(xs, ys)) if len(ts) else [], ts)
+def intersections_orbit_out(phi):
+    ts = find_roots(H_line_orbit_out, phi, t_orb_out_eps[0], t_orb_out_eps[1])
     if len(ts):
-        xloc, yloc = orb_out_local(r,T,np.array(ts))
-        xs, ys = translate_orbit(E, xloc, yloc, phi); xy = list(zip(xs, ys))
+        xloc, yloc = orb_out_local(np.array(ts))
+        xs, ys = translate_orbit(xloc, yloc, phi); xy = list(zip(xs, ys))
     else:
         xy = []
-    return sort_by_halfline(r,T,Rg,E,phi,'L', xy, ts)
-def intersections_fixed_out(r, T, Rg, E, phi, t_fix_out):
-    ts = find_roots(lambda t,*aa: H_line_fixed_out(r,T,Rg,E,t,*aa), (phi,), t_fix_out[0], t_fix_out[1])
-    xs, ys = stat_out(r,T,np.array(ts)) if len(ts) else (np.array([]), np.array([]))
-    return sort_by_halfline(r,T,Rg,E,phi,'R', list(zip(xs, ys)) if len(ts) else [], ts)
-def intersections_orbit_in(r, T, Rg, E, phi, t_orb_in):
-    ts = find_roots(lambda t,*aa: H_line_orbit_in(r,T,Rg,E,t,*aa), (phi,), t_orb_in[0], t_orb_in[1])
+    return sort_by_halfline(phi, 'L', xy, ts)
+def intersections_fixed_out(phi):
+    ts = find_roots(H_line_fixed_out, phi, t_fix_out_eps[0], t_fix_out_eps[1])
+    xs, ys = stat_out(np.array(ts)) if len(ts) else (np.array([]), np.array([]))
+    return sort_by_halfline(phi, 'R', list(zip(xs, ys)) if len(ts) else [], ts)
+def intersections_orbit_in(phi):
+    ts = find_roots(H_line_orbit_in, phi, t_orb_in_eps[0], t_orb_in_eps[1])
     if len(ts):
-        xloc, yloc = orb_in_local(r,T,np.array(ts))
-        xs, ys = translate_orbit(E, xloc, yloc, phi); xy = list(zip(xs, ys))
+        xloc, yloc = orb_in_local(np.array(ts))
+        xs, ys = translate_orbit(xloc, yloc, phi); xy = list(zip(xs, ys))
     else:
         xy = []
-    return sort_by_halfline(r,T,Rg,E,phi,'R', xy, ts)
+    return sort_by_halfline(phi, 'R', xy, ts)
 
-# ========= True areas for adiabatic pressures =========
+# ===== Analytic centerline areas (Green decomposition) =====
+def area_line_seg(p, q): return 0.5 * (p[0]*q[1] - p[1]*q[0])
+
+def A_stat_center(t0, t1): return (r*r/6.0) * (t1**3 - t0**3)
+def A_orb_center(t0, t1, phi):
+    base = (r*r/6.0) * (t1**3 - t0**3)
+    def F(t): return t*sin(phi + t) + cos(phi + t)
+    trans = -0.5 * E * r * (F(t1) - F(t0))
+    return base + trans
+
+def Mx_line_seg(p, q): return ((p[0] + q[0]) / 3.0) * area_line_seg(p, q)
+def My_line_seg(p, q): return ((p[1] + q[1]) / 3.0) * area_line_seg(p, q)
+
+def F_stat_Mx(t):
+    return (r**3/3.0)*( t**3*sin(t) + 4.0*t**2*cos(t) - 8.0*t*sin(t) - 8.0*cos(t) )
+def F_stat_My(t):
+    return (r**3/3.0)*( -t**3*cos(t) + 4.0*t**2*sin(t) + 8.0*t*cos(t) - 8.0*sin(t) )
+def Mx_stat_center(t0, t1): return F_stat_Mx(t1) - F_stat_Mx(t0)
+def My_stat_center(t0, t1): return F_stat_My(t1) - F_stat_My(t0)
+
+def F_stat_S1(t):
+    return (r**2)*((t**3)/6.0 + (t**2)*sin(2*t)/4.0 + t*cos(2*t)/2.0 - sin(2*t)/4.0)
+def F_stat_S2(t):
+    return (r**2)*(-(t**3)/6.0 + (t**2)*sin(2*t)/4.0 + t*cos(2*t)/2.0 - sin(2*t)/4.0)
+def S1_stat(t0, t1): return F_stat_S1(t1) - F_stat_S1(t0)
+def S2_stat(t0, t1): return F_stat_S2(t1) - F_stat_S2(t0)
+
+def Mx_orb_center(t0, t1, phi):
+    X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
+    p = P_stat_center(t0); q = P_stat_center(t1)
+    dx = q[0] - p[0]; dy = q[1] - p[1]; dx2 = q[0]**2 - p[0]**2
+    return (- Mx_stat_center(t0, t1)
+            + (2*X0*S1_stat(t0,t1) - X0*S2_stat(t0,t1) - 0.5*Y0*dx2 - (X0**2)*dy + X0*Y0*dx)/3.0)
+def My_orb_center(t0, t1, phi):
+    X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
+    p = P_stat_center(t0); q = P_stat_center(t1)
+    dx = q[0] - p[0]; dy = q[1] - p[1]; dy2 = q[1]**2 - p[1]**2
+    return (- My_stat_center(t0, t1)
+            + (0.5*X0*dy2 + Y0*S1_stat(t0,t1) - X0*Y0*dy - 2*Y0*S2_stat(t0,t1) + (Y0**2)*dx)/3.0)
+
+# ===== Sampling helpers =====
 def poly_area_centroid(points):
     if len(points) < 3:
         return 0.0, np.nan, np.nan
@@ -150,169 +230,214 @@ def poly_area_centroid(points):
         return 0.0, np.nan, np.nan
     Cx = (1.0/(6.0*A_signed)) * np.sum((x + x1) * cross)
     Cy = (1.0/(6.0*A_signed)) * np.sum((y + y1) * cross)
-    return abs(A_signed), Cx, Cy
+    A = abs(A_signed)
+    return A, Cx, Cy
 
-def sample_stat_out(r,T,t0,t1,N=400):
-    ts = np.linspace(t0,t1,max(2,N)); x,y = stat_out(r,T,ts); return list(zip(x,y))
-def sample_stat_in(r,T,t0,t1,N=400):
-    ts = np.linspace(t0,t1,max(2,N)); x,y = stat_in(r,T,ts);  return list(zip(x,y))
-def sample_orb_out_global(r,T,E,s0,s1,phi,N=400):
-    ts = np.linspace(s0,s1,max(2,N)); xloc,yloc = orb_out_local(r,T,ts); x,y = translate_orbit(E, xloc, yloc, phi); return list(zip(x,y))
-def sample_orb_in_global(r,T,E,s0,s1,phi,N=400):
-    ts = np.linspace(s0,s1,max(2,N)); xloc,yloc = orb_in_local(r,T,ts);  x,y = translate_orbit(E, xloc, yloc, phi);  return list(zip(x,y))
+def sample_stat_center(t0, t1, N=600):
+    ts = np.linspace(t0, t1, max(2, N)); return [tuple(P_stat_center(t)) for t in ts]
+def sample_orb_center(t0, t1, phi, N=600):
+    ts = np.linspace(t0, t1, max(2, N)); return [tuple(P_orb_center(t, phi)) for t in ts]
+def sample_stat_in(t0, t1, N=600):
+    ts = np.linspace(t0, t1, max(2, N)); x,y = stat_in(ts);  return list(zip(x, y))
+def sample_stat_out(t0, t1, N=600):
+    ts = np.linspace(t0, t1, max(2, N)); x,y = stat_out(ts); return list(zip(x, y))
+def sample_orb_out_global(s0, s1, phi, N=600):
+    ts = np.linspace(s0, s1, max(2, N)); xloc,yloc = orb_out_local(ts); x,y = translate_orbit(xloc, yloc, phi); return list(zip(x, y))
+def sample_orb_in_global(s0, s1, phi, N=600):
+    ts = np.linspace(s0, s1, max(2, N)); xloc,yloc = orb_in_local(ts);  x,y = translate_orbit(xloc, yloc, phi);  return list(zip(x, y))
 
-def pockets_true_A(r,T,Rg,E,phi, t_fix_in, t_orb_out):
-    t_fix, _, _ = intersections_fixed_in(r,T,Rg,E,phi, t_fix_in)
-    t_orb, _, _ = intersections_orbit_out(r,T,Rg,E,phi, t_orb_out)
+# ===== Chambers with CLAMP to RAW =====
+def chambers_A_centerline(phi):
+    t_fix, _, _ = intersections_fixed_in(phi)
+    t_orb, _, _ = intersections_orbit_out(phi)
     n = max(0, min(len(t_fix), len(t_orb)) - 1)
-    areas = []
+    out = []
     for j in range(n):
-        tf1, tf2 = t_fix[j], t_fix[j+1]
-        to1, to2 = t_orb[j], t_orb[j+1]
-        poly = []
-        x1, y1 = translate_orbit(E, *orb_out_local(r,T,np.array([to1])), phi); PO1 = (float(x1), float(y1))
-        x2, y2 = stat_in(r,T,np.array([tf1])); PF1 = (float(x2), float(y2))
-        poly += [PO1, PF1]
-        poly += sample_stat_in(r,T, tf1, tf2, N=300)[1:]
-        x4, y4 = translate_orbit(E, *orb_out_local(r,T,np.array([to2])), phi); PO2 = (float(x4), float(y4))
-        poly += [PO2]
-        poly += sample_orb_out_global(r,T,E, to2, to1, phi, N=300)[1:]
-        A_poly, _, _ = poly_area_centroid(poly); areas.append(A_poly)
-    return areas
+        tf1 = clamp(t_fix[j],   t_fix_in_raw[0],  t_fix_in_raw[1])
+        tf2 = clamp(t_fix[j+1], t_fix_in_raw[0],  t_fix_in_raw[1])
+        to1 = clamp(t_orb[j],   t_orb_out_raw[0], t_orb_out_raw[1])
+        to2 = clamp(t_orb[j+1], t_orb_out_raw[0], t_orb_out_raw[1])
+        PF1, PF2 = P_stat_center(tf1), P_stat_center(tf2)
+        PO1, PO2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
+        A  = area_line_seg(PO1, PF1) + A_stat_center(tf1, tf2) + area_line_seg(PF2, PO2) + A_orb_center(to2, to1, phi)
+        Mx = Mx_line_seg(PO1, PF1)   + Mx_stat_center(tf1, tf2) + Mx_line_seg(PF2, PO2)   + Mx_orb_center(to2, to1, phi)
+        My = My_line_seg(PO1, PF1)   + My_stat_center(tf1, tf2) + My_line_seg(PF2, PO2)   + My_orb_center(to2, to1, phi)
+        if A < 0: A, Mx, My = -A, -Mx, -My
+        out.append((A, Mx/A, My/A))
+    return out
 
-def pockets_true_B(r,T,Rg,E,phi, t_fix_out, t_orb_in):
-    t_fix, _, _ = intersections_fixed_out(r,T,Rg,E,phi, t_fix_out)
-    t_orb, _, _ = intersections_orbit_in(r,T,Rg,E,phi, t_orb_in)
+def chambers_B_centerline(phi):
+    t_fix, _, _ = intersections_fixed_out(phi)
+    t_orb, _, _ = intersections_orbit_in(phi)
     n = max(0, min(len(t_fix), len(t_orb)) - 1)
-    areas = []
+    out = []
     for j in range(n):
-        tf1, tf2 = t_fix[j], t_fix[j+1]
-        to1, to2 = t_orb[j], t_orb[j+1]
-        poly = []
-        x1, y1 = translate_orbit(E, *orb_in_local(r,T,np.array([to1])), phi); PO1 = (float(x1), float(y1))
-        x2, y2 = stat_out(r,T,np.array([tf1])); PF1 = (float(x2), float(y2))
-        poly += [PO1, PF1]
-        poly += sample_stat_out(r,T, tf1, tf2, N=300)[1:]
-        x4, y4 = translate_orbit(E, *orb_in_local(r,T,np.array([to2])), phi); PO2 = (float(x4), float(y4))
-        poly += [PO2]
-        poly += sample_orb_in_global(r,T,E, to2, to1, phi, N=300)[1:]
-        A_poly, _, _ = poly_area_centroid(poly); areas.append(A_poly)
-    return areas
+        tf1 = clamp(t_fix[j],   t_fix_out_raw[0], t_fix_out_raw[1])
+        tf2 = clamp(t_fix[j+1], t_fix_out_raw[0], t_fix_out_raw[1])
+        to1 = clamp(t_orb[j],   t_orb_in_raw[0],  t_orb_in_raw[1])
+        to2 = clamp(t_orb[j+1], t_orb_in_raw[0],  t_orb_in_raw[1])
+        PF1, PF2 = P_stat_center(tf1), P_stat_center(tf2)
+        PO1, PO2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
+        A  = area_line_seg(PO1, PF1) + A_stat_center(tf1, tf2) + area_line_seg(PF2, PO2) + A_orb_center(to2, to1, phi)
+        Mx = Mx_line_seg(PO1, PF1)   + Mx_stat_center(tf1, tf2) + Mx_line_seg(PF2, PO2)   + Mx_orb_center(to2, to1, phi)
+        My = My_line_seg(PO1, PF1)   + My_stat_center(tf1, tf2) + My_line_seg(PF2, PO2)   + My_orb_center(to2, to1, phi)
+        if A < 0: A, Mx, My = -A, -Mx, -My
+        out.append((A, Mx/A, My/A))
+    return out
 
-# ========= Build pA,pB (adiabatic) & per-phi pack =========
-def build_base_forces(variant="R32"):
-    V = VARIANTS[variant]
-    Rg = V["Rg"]; r = Rg; T = V["T"]; phi0_deg = V["phi0_deg"]
-    E = (2*pi*Rg - 2*T)/2.0
-    t_fix_in  = np.deg2rad(V["N_fix_in_deg"]  + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
-    t_fix_out = np.deg2rad(V["N_fix_out_deg"] + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
-    t_orb_in  = np.deg2rad(V["N_orb_in_deg"]  + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
-    t_orb_out = np.deg2rad(V["N_orb_out_deg"] + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
+def chamber_C1_centerline(phi):
+    t_fix_L, _, _ = intersections_fixed_in(phi)
+    t_orb_L, _, _ = intersections_orbit_out(phi)
+    t_fix_R, _, _ = intersections_fixed_out(phi)
+    t_orb_R, _, _ = intersections_orbit_in(phi)
+    if len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0:
+        return np.nan, np.nan, np.nan
+    tL = clamp(t_fix_L[0], t_fix_in_raw[0],  t_fix_in_raw[1])
+    tR = clamp(t_fix_R[0], t_fix_out_raw[0], t_fix_out_raw[1])
+    sL = clamp(t_orb_L[0], t_orb_out_raw[0], t_orb_out_raw[1])
+    sR = clamp(t_orb_R[0], t_orb_in_raw[0],  t_orb_in_raw[1])
+    P_stat_L, P_stat_R = P_stat_center(tL), P_stat_center(tR)
+    P_orb_L,  P_orb_R  = P_orb_center(sL, phi), P_orb_center(sR, phi)
+    A  = area_line_seg(P_stat_L, P_orb_L) + A_orb_center(sL, sR, phi) + area_line_seg(P_orb_R, P_stat_R) + A_stat_center(tR, tL)
+    Mx = Mx_line_seg(P_stat_L, P_orb_L)   + Mx_orb_center(sL, sR, phi) + Mx_line_seg(P_orb_R, P_stat_R)   + Mx_stat_center(tR, tL)
+    My = My_line_seg(P_stat_L, P_orb_L)   + My_orb_center(sL, sR, phi) + My_line_seg(P_orb_R, P_stat_R)   + My_stat_center(tR, tL)
+    if A < 0: A, Mx, My = -A, -Mx, -My
+    return A, Mx/A, My/A
 
-    num_main = int(360.0/DEG_STEP_MAIN)
-    phis = [np.deg2rad(phi0_deg + DEG_STEP_MAIN*i) for i in range(num_main)]
-    degs = [DEG_STEP_MAIN*i for i in range(num_main)]
+# ===== Suction (centerline + patch), using RAW endpoints =====
+def suction_centerline_v1(phi):
+    t_fix_L, _, _ = intersections_fixed_in(phi)
+    t_orb_L, _, _ = intersections_orbit_out(phi)
+    t_fix_R, _, _ = intersections_fixed_out(phi)
+    t_orb_R, _, _ = intersections_orbit_in(phi)
+    if len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0:
+        return np.nan, np.nan, np.nan
+    tfL = clamp(t_fix_L[-1], t_fix_in_raw[0],  t_fix_in_raw[1])
+    toL = clamp(t_orb_L[-1], t_orb_out_raw[0], t_orb_out_raw[1])
+    tfR = clamp(t_fix_R[-1], t_fix_out_raw[0], t_fix_out_raw[1])
+    toR = clamp(t_orb_R[-1], t_orb_in_raw[0],  t_orb_in_raw[1])
+    tf_in_end  = t_fix_in_raw[1]
+    tf_out_end = t_fix_out_raw[1]
+    to_out_end = t_orb_out_raw[1]
+    to_in_end  = t_orb_in_raw[1]
 
-    # anchors
-    A_true0 = pockets_true_A(r,T,Rg,E, phis[0], t_fix_in, t_orb_out)[::-1]
-    B_true180 = pockets_true_B(r,T,Rg,E, phis[(180//int(DEG_STEP_MAIN))], t_fix_out, t_orb_in)[::-1]
-    A_anchor = A_true0[0] if len(A_true0)>0 else np.nan
-    B_anchor = B_true180[0] if len(B_true180)>0 else np.nan
+    pts = []
+    pts += sample_stat_center(tfL, tf_in_end, N=500)
+    pts.append(tuple(P_stat_center(tf_out_end)))
+    pts += sample_stat_center(tf_out_end, tfR, N=500)
+    pts.append(tuple(P_orb_center(toR, phi)))
+    pts += sample_orb_center(toR, to_in_end, phi, N=500)
+    pts.append(tuple(P_orb_center(to_out_end, phi)))
+    pts += sample_orb_center(to_out_end, toL, phi, N=500)
+    pts.append(tuple(P_stat_center(tfL)))
+    A_poly, Cx_poly, Cy_poly = poly_area_centroid(pts)
+    A_total = A_poly + PATCH_AREA
+    Cx = (A_poly*Cx_poly + PATCH_AREA*PATCH_CX)/A_total
+    Cy = (A_poly*Cy_poly + PATCH_AREA*PATCH_CY)/A_total
+    return A_total, Cx, Cy
 
-    per_phi = []
-    for phi,deg in zip(phis,degs):
-        # determine open side (for suction pocket pressure assignment)
-        open_side = 'B' if deg < 180.0 else 'A'
-        # true areas for pockets at this phi
-        A_true = pockets_true_A(r,T,Rg,E, phi, t_fix_in, t_orb_out)[::-1]
-        B_true = pockets_true_B(r,T,Rg,E, phi, t_fix_out, t_orb_in)[::-1]
+def suction_centerline_v2(phi):
+    # alternative ordering to avoid occasional self-overlap
+    t_fix_L, _, _ = intersections_fixed_in(phi)
+    t_orb_L, _, _ = intersections_orbit_out(phi)
+    t_fix_R, _, _ = intersections_fixed_out(phi)
+    t_orb_R, _, _ = intersections_orbit_in(phi)
+    if len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0:
+        return np.nan, np.nan, np.nan
+    tfL = clamp(t_fix_L[-1], t_fix_in_raw[0],  t_fix_in_raw[1])
+    toL = clamp(t_orb_L[-1], t_orb_out_raw[0], t_orb_out_raw[1])
+    tfR = clamp(t_fix_R[-1], t_fix_out_raw[0], t_fix_out_raw[1])
+    toR = clamp(t_orb_R[-1], t_orb_in_raw[0],  t_orb_in_raw[1])
+    tf_in_end  = t_fix_in_raw[1]
+    tf_out_end = t_fix_out_raw[1]
+    to_out_end = t_orb_out_raw[1]
+    to_in_end  = t_orb_in_raw[1]
 
-        # suction true area just so p arrays align (value itself is Ps)
-        if open_side=='A':
-            A_tr = [np.nan] + A_true  # head is suction => Ps
-            B_tr = B_true
-        else:
-            B_tr = [np.nan] + B_true
-            A_tr = A_true
+    pts = []
+    pts += [tuple(P_stat_center(tfL))]
+    pts += sample_stat_center(tfL, tf_in_end, N=500)
+    pts += [tuple(P_orb_center(to_out_end, phi))]
+    pts += sample_orb_center(to_out_end, toL, phi, N=500)
+    pts += [tuple(P_stat_center(tfR))]
+    pts += sample_stat_center(tfR, tf_out_end, N=500)
+    pts += [tuple(P_orb_center(to_in_end, phi))]
+    pts += sample_orb_center(to_in_end, toR, phi, N=500)
+    A_poly, Cx_poly, Cy_poly = poly_area_centroid(pts)
+    A_total = A_poly + PATCH_AREA
+    Cx = (A_poly*Cx_poly + PATCH_AREA*PATCH_CX)/A_total
+    Cy = (A_poly*Cy_poly + PATCH_AREA*PATCH_CY)/A_total
+    return A_total, Cx, Cy
 
-        # adiabatic pressures
-        def p_from_anchor(lst, anchor):
-            out=[]
-            for Anow in lst:
-                if np.isnan(anchor) or Anow is None or np.isnan(Anow) or Anow<=1e-12: out.append(np.nan)
-                else: out.append(P_SUCTION_MP*((anchor/Anow)**GAMMA))
-            return out
-        pA = p_from_anchor(A_tr, A_anchor)
-        pB = p_from_anchor(B_tr, B_anchor)
+# ===== Sweep with constancy check =====
+ENFORCE_CONST = True
+TOL_CONST = 0.2  # mm^2
 
-        # enforce suction = Ps on the head element of the open side
-        if open_side=='A' and len(pA)>0: pA[0]=P_SUCTION_MP
-        if open_side=='B' and len(pB)>0: pB[0]=P_SUCTION_MP
-
-        per_phi.append(dict(phi=phi, deg=deg, pA=pA, pB=pB))
-    return dict(Rg=Rg, r=r, T=T, E=E, t_fix_in=t_fix_in, t_fix_out=t_fix_out, per_phi=per_phi)
-
-# ========= Theta sum term (center arc) =========
-def theta_sum_terms_mm(r,T,Rg,E,phi, t_fix_in, t_fix_out):
-    t_fix_L, _, _ = intersections_fixed_in(r,T,Rg,E,phi, t_fix_in)
-    t_fix_R, _, _ = intersections_fixed_out(r,T,Rg,E,phi, t_fix_out)
-    if len(t_fix_L)==0 or len(t_fix_R)==0: return np.nan
-    tL = t_fix_L[0]; tR = t_fix_R[0]
-    return Rg*(tL + tR)
-
-# ========= Export function =========
-def export_force_components(variant="R32", Pc1=5.0, out_csv=None):
-    base = build_base_forces(variant)
-    Rg = base["Rg"]; r=base["r"]; T=base["T"]; E=base["E"]
-    t_fix_in=base["t_fix_in"]; t_fix_out=base["t_fix_out"]
-    per_phi = base["per_phi"]
-
+def sweep_R32_constancy(out_csv="/mnt/data/areas_R32_constancy_epssplit.csv", plot_png="/mnt/data/area_constancy_R32_epssplit.png"):
+    phis = [np.deg2rad(phi0_deg + deg_step*i) for i in range(num_steps)]
+    degs = [deg_step*i for i in range(num_steps)]
     rows = []
-    max_err = 0.0
-    for ent in per_phi:
-        phi = ent["phi"]; deg = ent["deg"]
-        ur = u_dir(phi); nt = n_perp(phi)
 
-        # line loads
-        Lr = 2.0*Rg*(Pc1 - P_SUCTION_MP)  # N/mm
-        pA = ent["pA"]; pB = ent["pB"]
-        Lt_terms = []
-        for idx in [0,1]:
-            if idx < len(pB) and not np.isnan(pB[idx]):
-                Lt_terms.append((pB[idx]-P_SUCTION_MP)*(2.0*pi*Rg))
-        for idx in [0,1,2]:
-            if idx < len(pA) and not np.isnan(pA[idx]):
-                Lt_terms.append((pA[idx]-P_SUCTION_MP)*(2.0*pi*Rg))
-        Rg_theta = theta_sum_terms_mm(r,T,Rg,E,phi, t_fix_in, t_fix_out)
-        if not np.isnan(Rg_theta):
-            Lt_terms.append((Pc1 - P_SUCTION_MP)*Rg_theta)
-        Lt = np.sum(Lt_terms) if len(Lt_terms) else 0.0
+    # target total at first φ using v1 suction
+    phi0 = phis[0]
+    A0_list = chambers_A_centerline(phi0)[::-1]
+    B0_list = chambers_B_centerline(phi0)[::-1]
+    C10,_,_ = chamber_C1_centerline(phi0)
+    Su0,_,_ = suction_centerline_v1(phi0)
+    open0 = 'B' if degs[0] < 180.0 else 'A'
+    if open0=='A':
+        target_total = Su0 + sum([a for a,_,_ in A0_list]) + sum([a for a,_,_ in B0_list]) + (C10 if not np.isnan(C10) else 0.0)
+    else:
+        target_total = Su0 + sum([a for a,_,_ in B0_list]) + sum([a for a,_,_ in A0_list]) + (C10 if not np.isnan(C10) else 0.0)
 
-        # forces (N)
-        F_radial  = -Lr * h_wrap     # inward negative (since Lr>0 when Pc1>Ps)
-        F_tangent =  Lt * h_wrap
+    for phi,deg in zip(phis,degs):
+        open_side = 'B' if deg < 180.0 else 'A'
+        A_list = chambers_A_centerline(phi)[::-1]
+        B_list = chambers_B_centerline(phi)[::-1]
+        C1A, C1cx, C1cy = chamber_C1_centerline(phi)
 
-        Fx = F_radial*ur[0] + F_tangent*nt[0]
-        Fy = F_radial*ur[1] + F_tangent*nt[1]
+        Su1, Su1x, Su1y = suction_centerline_v1(phi)
+        Su2, Su2x, Su2y = suction_centerline_v2(phi)
 
-        lhs = F_radial**2 + F_tangent**2
-        rhs = Fx**2 + Fy**2
-        max_err = max(max_err, abs(lhs - rhs))
+        base = sum([a for a,_,_ in A_list]) + sum([a for a,_,_ in B_list]) + (C1A if not np.isnan(C1A) else 0.0)
+        total1 = base + (Su1 if not np.isnan(Su1) else 0.0)
+        total2 = base + (Su2 if not np.isnan(Su2) else 0.0)
 
-        rows.append(dict(phi_deg=float(deg),
-                         F_radial=float(F_radial),
-                         F_tangent=float(F_tangent),
-                         F_x=float(Fx),
-                         F_y=float(Fy)))
+        if abs(total1 - target_total) <= abs(total2 - target_total):
+            SuA, Sucx, Sucy, chosen = Su1, Su1x, Su1y, 'v1'; total = total1
+        else:
+            SuA, Sucx, Sucy, chosen = Su2, Su2x, Su2y, 'v2'; total = total2
 
-    df = pd.DataFrame(rows).sort_values("phi_deg").reset_index(drop=True)
-    if out_csv is None:
-        out_csv = f"/mnt/data/force_components_{variant}_Pc1_{Pc1:.1f}.csv"
+        delta = 0.0
+        if ENFORCE_CONST and abs(total - target_total) > TOL_CONST:
+            SuA = (SuA if not np.isnan(SuA) else 0.0) + (target_total - total)
+            delta = (target_total - total)
+            total = base + SuA
+
+        if open_side=='A':
+            A_cl = [(SuA, Sucx, Sucy)] + A_list; B_cl = B_list
+        else:
+            B_cl = [(SuA, Sucx, Sucy)] + B_list; A_cl = A_list
+
+        rows.append({"phi_deg":deg, "open_side":open_side, "strategy":chosen, "delta_applied":delta,
+                     "sum_A": sum([a for a,_,_ in A_cl]), "sum_B": sum([a for a,_,_ in B_cl]),
+                     "C1": (C1A if not np.isnan(C1A) else 0.0), "sum_total": total})
+
+    df = pd.DataFrame(rows)
     df.to_csv(out_csv, index=False)
-    print("Wrote:", out_csv)
-    print("Max |(Fr^2+Ft^2) - (Fx^2+Fy^2)| =", max_err)
-    return df, out_csv, max_err
+
+    vals = df["sum_total"].to_numpy(dtype=float)
+    phideg = df["phi_deg"].to_numpy(dtype=float)
+    plt.figure()
+    plt.plot(phideg, vals - np.nanmean(vals), marker='o')
+    plt.axhline(0, linestyle='--')
+    plt.xlabel("phi_deg"); plt.ylabel("sum_total - mean [mm^2]")
+    plt.title("R32 area constancy (EPS only for intersections; areas use RAW)")
+    plt.grid(True); plt.savefig(plot_png, dpi=140, bbox_inches="tight"); plt.close()
+
+    print("Constancy after clamp approach: min={:.6f}, max={:.6f}, mean={:.6f}, range={:.6f}".format(
+        float(np.nanmin(vals)), float(np.nanmax(vals)), float(np.nanmean(vals)), float(np.nanmax(vals)-np.nanmin(vals))
+    ))
+    return df
 
 if __name__ == "__main__":
-    # Example: R32 at Pc1=5.0 MPa
-    export_force_components("R32", 5.0)
+    sweep_R32_constancy()
