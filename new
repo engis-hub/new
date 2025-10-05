@@ -1,443 +1,717 @@
-r'''# -*- coding: utf-8 -*-
-"""
-R32 area constancy with split EPS handling:
-- EPS is used ONLY to widen search intervals for intersection root finding.
-- All area computations (centerline chambers A/B/C1 and suction) clamp t-values to RAW winding domains.
-- Uses user's new R32 patch & metadata (unused items kept for clarity).
-Outputs:
-  CSV: /mnt/data/areas_R32_constancy_epssplit.csv
-  PNG: /mnt/data/area_constancy_R32_epssplit.png
-"""
+# -*- coding: utf-8 -*-
 
+#
 import numpy as np
 import pandas as pd
-from numpy import sin, cos, pi
+import math, os
 import matplotlib.pyplot as plt
 
-# ===== R32 parameters (as provided) =====
-Rg = 
-T  = 
-r  = Rg
-phi0_deg = 
-E  = (2*pi*Rg - 2*T) / 2.0
+# ----------------------------- Variants -----------------------------
+VARIANTS = {
+    "R32": dict(
+        # involute geometry parameter 
+        Rg=2.62606, T=3.65, phi0_deg=217.0,
+        N_fix_in_deg  = np.array([]),
+        N_fix_out_deg = np.array([]),
+        N_orb_in_deg  = np.array([]),
+        N_orb_out_deg = np.array([]),
+        # suction patch (beyond centerline chain), given by user
+        PATCH_AREA=357.0214, PATCH_CX=-44.7559, PATCH_CY=16.2285,
+        # pressure & heights
+        GAMMA=1.45, P_suction_MP=1.0, P_C1_MP=5.0,
+        mirror_radius=58.0,
+        h_wrap=35.2, h_mirror=8.5, h_main_bearing=31.5,
+        # bottom / lateral fixed points
+        P_middle=1.4,                       # MPa
+        p_m_point=np.array([0.2321, 5.2002]),   # centroid for middle-pressure zone (mm)
+        seal_radius=57.6/2,                 # mm
+        P_seal_point=np.array([-0.9496, 4.0354]),  # centroid of seal area (mm)
+    ),
+    "R290": dict(
+        # R290 geometry from earlier
+        Rg=2.51465, T=3.30, phi0_deg=169.0,
+        N_fix_in_deg  = np.array([]),
+        N_fix_out_deg = np.array([]),
+        N_orb_in_deg  = np.array([]),
+        N_orb_out_deg = np.array([]),
+        # suction patch (beyond centerline chain)
+        PATCH_AREA=331.6113, PATCH_CX=-42.0522, PATCH_CY=-22.4137,
+        # pressure & heights
+        GAMMA=1.20, P_suction_MP=1.0, P_C1_MP=5.0,
+        mirror_radius=60.0,
+        h_wrap=34.0, h_mirror=8.0, h_main_bearing=31.5,
+        # bottom / lateral fixed points (from user)
+        P_middle=1.4,
+        p_m_point=np.array([-3.5111, 3.5388]),
+        seal_radius=57.6/2,
+        P_seal_point=np.array([-3.6140, 2.0259]),
+    ),
+}
 
-# Winding angles (RAW, no EPS for area)
-N_fix_in_deg_raw  = np.array([])
-N_fix_out_deg_raw = np.array([])
-N_orb_in_deg_raw  = np.array([])
-N_orb_out_deg_raw = np.array([])
-
-t_fix_in_raw  = np.deg2rad(N_fix_in_deg_raw )
-t_fix_out_raw = np.deg2rad(N_fix_out_deg_raw)
-t_orb_in_raw  = np.deg2rad(N_orb_in_deg_raw )
-t_orb_out_raw = np.deg2rad(N_orb_out_deg_raw)
-
-# EPS-extended for root finding only
+# EPS only for intersection root find
 EPS_FIX_DEG = 0.6
 EPS_ORB_DEG = 1.2
-t_fix_in_eps  = np.deg2rad(N_fix_in_deg_raw  + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
-t_fix_out_eps = np.deg2rad(N_fix_out_deg_raw + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
-t_orb_in_eps  = np.deg2rad(N_orb_in_deg_raw  + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
-t_orb_out_eps = np.deg2rad(N_orb_out_deg_raw + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
 
-# Milling patch (updated R32)
-PATCH_AREA = 350.1413
-PATCH_CX   = -44.8444
-PATCH_CY   =  16.2285
+# -------------- Core geometry helpers (centerlines & surfaces) --------------
+def build_geom(variant):
+    Rg = variant["Rg"]; T=variant["T"]; r=Rg
+    phi0_deg = variant["phi0_deg"]
+    E = (2*np.pi*Rg - 2*T) / 2.0
 
-# Unused (kept for reference)
-GAMMA = 1.45
-mirror_radius = 58.0
-h_wrap = 35.2
-h_mirror = 8.5
-h_main_bearing = 31.5
-seal_radius = 57.6/2.0
-p_m_point = np.array([0.2321, 5.2002])
-P_seal_point = np.array([-0.9496, 4.0354])
+    # RAW winding (rad)
+    t_fix_in_raw  = np.deg2rad(variant["N_fix_in_deg"] )
+    t_fix_out_raw = np.deg2rad(variant["N_fix_out_deg"])
+    t_orb_in_raw  = np.deg2rad(variant["N_orb_in_deg"] )
+    t_orb_out_raw = np.deg2rad(variant["N_orb_out_deg"])
 
-# Sweep
-deg_step = 10.0
-num_steps = int(360/deg_step)
+    # EPS for roots
+    t_fix_in_eps  = np.deg2rad(variant["N_fix_in_deg"]  + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
+    t_fix_out_eps = np.deg2rad(variant["N_fix_out_deg"] + np.array([-EPS_FIX_DEG, +EPS_FIX_DEG]))
+    t_orb_in_eps  = np.deg2rad(variant["N_orb_in_deg"]  + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
+    t_orb_out_eps = np.deg2rad(variant["N_orb_out_deg"] + np.array([-EPS_ORB_DEG, +EPS_ORB_DEG]))
 
-# ===== Helpers =====
-def u_dir(phi):  return np.array([np.cos(phi), -np.sin(phi)])
-def n_perp(phi): return np.array([np.sin(phi),  np.cos(phi)])
+    def u_dir(phi):  return np.array([np.cos(phi), -np.sin(phi)])
+    def n_perp(phi): return np.array([np.sin(phi),  np.cos(phi)])
 
-def translate_orbit(x, y, phi):
-    return x + E*np.cos(phi), y - E*np.sin(phi)
+    # Centerlines
+    def P_stat_center(t):
+        return np.array([-r*(np.sin(t) - t*np.cos(t)),  r*(np.cos(t) + t*np.sin(t))])
+    def P_orb_center(t, phi):
+        X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
+        return np.array([ r*(np.sin(t) - t*np.cos(t)) + X0, -r*(np.cos(t) + t*np.sin(t)) + Y0 ])
 
-def P_stat_center(t):
-    return np.array([-r*(sin(t) - t*cos(t)),  r*(cos(t) + t*sin(t))])
-def P_orb_center(t, phi):
-    X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
-    return np.array([ r*(sin(t) - t*cos(t)) + X0, -r*(cos(t) + t*sin(t)) + Y0 ])
+    # Offset surfaces (for intersections)
+    def stat_out(t):
+        x = -r*(np.sin(t) - t*np.cos(t)) + (T/2.0)*np.cos(t)
+        y =  r*(np.cos(t) + t*np.sin(t)) + (T/2.0)*np.sin(t)
+        return x, y
+    def stat_in(t):
+        x = -r*(np.sin(t) - t*np.cos(t)) - (T/2.0)*np.cos(t)
+        y =  r*(np.cos(t) + t*np.sin(t)) - (T/2.0)*np.sin(t)
+        return x, y
+    def orb_out_local(t):
+        x =  r*(np.sin(t) - t*np.cos(t)) - (T/2.0)*np.cos(t)
+        y = -r*(np.cos(t) + t*np.sin(t)) - (T/2.0)*np.sin(t)
+        return x, y
+    def orb_in_local(t):
+        x =  r*(np.sin(t) - t*np.cos(t)) + (T/2.0)*np.cos(t)
+        y = -r*(np.cos(t) + t*np.sin(t)) + (T/2.0)*np.sin(t)
+        return x, y
+    def translate_orbit(x, y, phi):
+        return x + E*np.cos(phi), y - E*np.sin(phi)
 
-def stat_out(t):
-    x = -r*(sin(t) - t*cos(t)) + (T/2.0)*cos(t)
-    y =  r*(cos(t) + t*sin(t)) + (T/2.0)*sin(t)
-    return x, y
-def stat_in(t):
-    x = -r*(sin(t) - t*cos(t)) - (T/2.0)*cos(t)
-    y =  r*(cos(t) + t*sin(t)) - (T/2.0)*sin(t)
-    return x, y
-def orb_out_local(t):
-    x =  r*(sin(t) - t*cos(t)) - (T/2.0)*cos(t)
-    y = -r*(cos(t) + t*sin(t)) - (T/2.0)*sin(t)
-    return x, y
-def orb_in_local(t):
-    x =  r*(sin(t) - t*cos(t)) + (T/2.0)*cos(t)
-    y = -r*(cos(t) + t*sin(t)) + (T/2.0)*sin(t)
-    return x, y
+    # Intersections
+    def H_line_fixed_in(t, phi):
+        n = n_perp(phi); r0 =  Rg*n
+        x, y = stat_in(t);  return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+    def H_line_fixed_out(t, phi):
+        n = n_perp(phi); r0 = -Rg*n
+        x, y = stat_out(t); return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+    def H_line_orbit_out(t, phi):
+        n = n_perp(phi); r0 =  Rg*n
+        x, y = translate_orbit(*orb_out_local(t), phi); return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+    def H_line_orbit_in(t, phi):
+        n = n_perp(phi); r0 = -Rg*n
+        x, y = translate_orbit(*orb_in_local(t), phi);  return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
 
-# Clamp to RAW domain
-def clamp(t, tmin, tmax):
-    return max(tmin, min(tmax, t))
+    def _bisect(func, a, b, phi, itmax=60, tol=1e-12):
+        fa, fb = func(a, phi), func(b, phi)
+        if fa*fb > 0: return None
+        lo, hi, flo, fhi = a, b, fa, fb
+        for _ in range(itmax):
+            m = 0.5*(lo + hi); fm = func(m, phi)
+            if abs(fm) <= 1e-14 or (hi-lo)/2 < tol*(1+abs(m)): return m
+            if flo*fm <= 0: hi, fhi = m, fm
+            else:           lo, flo = m, fm
+        return 0.5*(lo + hi)
 
-# ===== Intersections (use EPS intervals) =====
-def H_line_fixed_in(t, phi):
-    n = n_perp(phi); r0 =  Rg*n
-    x, y = stat_in(t);  return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
-def H_line_fixed_out(t, phi):
-    n = n_perp(phi); r0 = -Rg*n
-    x, y = stat_out(t); return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
-def H_line_orbit_out(t, phi):
-    n = n_perp(phi); r0 =  Rg*n
-    x, y = translate_orbit(*orb_out_local(t), phi); return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
-def H_line_orbit_in(t, phi):
-    n = n_perp(phi); r0 = -Rg*n
-    x, y = translate_orbit(*orb_in_local(t), phi);  return n[0]*(x - r0[0]) + n[1]*(y - r0[1])
+    def find_roots(func, phi, tmin, tmax, M=24000, tol_zero=1e-9):
+        ts = np.linspace(tmin, tmax, M+1)
+        Hs = func(ts, phi)
+        roots = []
+        nz = np.where(np.abs(Hs) <= tol_zero)[0].tolist()
+        for i in nz: roots.append(ts[i])
+        for i in range(M):
+            a, b, fa, fb = ts[i], ts[i+1], Hs[i], Hs[i+1]
+            if fa*fb < 0:
+                m = _bisect(func, a, b, phi);  roots += ([] if m is None else [m])
+            else:
+                if abs(fa) < 10*tol_zero:
+                    left = max(tmin, a - (tmax-tmin)/M)
+                    m = _bisect(func, left, min(b, a+(tmax-tmin)/M), phi);  roots += ([] if m is None else [m])
+                if abs(fb) < 10*tol_zero:
+                    right = min(tmax, b + (tmax-tmin)/M)
+                    m = _bisect(func, max(a, b-(tmax-tmin)/M), right, phi); roots += ([] if m else [])
+        roots = sorted(set([float(np.round(r, 10)) for r in roots]))
+        return roots
 
-def _bisect(func, a, b, phi, itmax=60, tol=1e-12):
-    fa, fb = func(a, phi), func(b, phi)
-    if fa*fb > 0: return None
-    lo, hi, flo, fhi = a, b, fa, fb
-    for _ in range(itmax):
-        m = 0.5*(lo + hi)
-        fm = func(m, phi)
-        if abs(fm) <= 1e-14 or (hi-lo)/2 < tol*(1+abs(m)): return m
-        if flo*fm <= 0: hi, fhi = m, fm
-        else:           lo, flo = m, fm
-    return 0.5*(lo + hi)
-
-def find_roots(func, phi, tmin, tmax, M=22000, tol_zero=1e-9):
-    ts = np.linspace(tmin, tmax, M+1)
-    Hs = func(ts, phi)
-    roots = []
-    nz = np.where(np.abs(Hs) <= tol_zero)[0].tolist()
-    for i in nz: roots.append(ts[i])
-    for i in range(M):
-        a, b, fa, fb = ts[i], ts[i+1], Hs[i], Hs[i+1]
-        if fa*fb < 0:
-            m = _bisect(func, a, b, phi);  roots += ([] if m is None else [m])
+    def sort_by_halfline(phi, side, xy_pts, ts):
+        if len(ts) == 0: return [], [], []
+        n = n_perp(phi); u = u_dir(phi)
+        r0 = ( Rg*n if side=='L' else -Rg*n )
+        pts = np.array(xy_pts) if len(xy_pts) else np.zeros((0,2))
+        s_vals = (pts - r0) @ u if len(xy_pts) else np.array([])
+        if side=='L':
+            keep_idx = np.where(s_vals > 0)[0]; order = np.argsort(s_vals[keep_idx])  # inner->outer
         else:
-            if abs(fa) < 10*tol_zero:
-                left = max(tmin, a - (tmax-tmin)/M)
-                m = _bisect(func, left, min(b, a+(tmax-tmin)/M), phi);  roots += ([] if m is None else [m])
-            if abs(fb) < 10*tol_zero:
-                right = min(tmax, b + (tmax-tmin)/M)
-                m = _bisect(func, max(a, b-(tmax-tmin)/M), right, phi); roots += ([] if m else [])
-    roots = sorted(set([float(np.round(r, 10)) for r in roots]))
-    return roots
+            keep_idx = np.where(s_vals < 0)[0]; order = np.argsort(-s_vals[keep_idx]) # inner->outer
+        ts_keep  = np.array(ts)[keep_idx][order]
+        pts_keep = pts[keep_idx][order] if len(pts) else pts
+        s_keep   = (pts_keep - r0) @ u if len(pts_keep) else np.array([])
+        return [float(x) for x in ts_keep], [tuple(p) for p in pts_keep], [float(x) for x in s_keep]
 
-def sort_by_halfline(phi, side, xy_pts, ts):
-    if len(ts) == 0: return [], [], []
-    n = n_perp(phi); u = u_dir(phi)
-    r0 = ( Rg*n if side=='L' else -Rg*n )
-    pts = np.array(xy_pts)
-    s_vals = (pts - r0) @ u
-    if side=='L':
-        keep_idx = np.where(s_vals > 0)[0]; order = np.argsort(s_vals[keep_idx])
-    else:
-        keep_idx = np.where(s_vals < 0)[0]; order = np.argsort(-s_vals[keep_idx])
-    ts_keep  = np.array(ts)[keep_idx][order]
-    pts_keep = pts[keep_idx][order]
-    return [float(x) for x in ts_keep], [tuple(p) for p in pts_keep], list((pts_keep - r0) @ u)
+    def intersections_fixed_in(phi):
+        ts = find_roots(H_line_fixed_in, phi, t_fix_in_eps[0], t_fix_in_eps[1])
+        xs, ys = stat_in(np.array(ts)) if len(ts) else (np.array([]), np.array([]))
+        return sort_by_halfline(phi, 'L', list(zip(xs, ys)) if len(ts) else [], ts)
+    def intersections_orbit_out(phi):
+        ts = find_roots(H_line_orbit_out, phi, t_orb_out_eps[0], t_orb_out_eps[1])
+        if len(ts):
+            xloc, yloc = orb_out_local(np.array(ts))
+            xs, ys = translate_orbit(xloc, yloc, phi); xy = list(zip(xs, ys))
+        else:
+            xy = []
+        return sort_by_halfline(phi, 'L', xy, ts)
+    def intersections_fixed_out(phi):
+        ts = find_roots(H_line_fixed_out, phi, t_fix_out_eps[0], t_fix_out_eps[1])
+        xs, ys = stat_out(np.array(ts)) if len(ts) else (np.array([]), np.array([]))
+        return sort_by_halfline(phi, 'R', list(zip(xs, ys)) if len(ts) else [], ts)
+    def intersections_orbit_in(phi):
+        ts = find_roots(H_line_orbit_in, phi, t_orb_in_eps[0], t_orb_in_eps[1])
+        if len(ts):
+            xloc, yloc = orb_in_local(np.array(ts))
+            xs, ys = translate_orbit(xloc, yloc, phi); xy = list(zip(xs, ys))
+        else:
+            xy = []
+        return sort_by_halfline(phi, 'R', xy, ts)
 
-def intersections_fixed_in(phi):
-    ts = find_roots(H_line_fixed_in, phi, t_fix_in_eps[0], t_fix_in_eps[1])
-    xs, ys = stat_in(np.array(ts)) if len(ts) else (np.array([]), np.array([]))
-    return sort_by_halfline(phi, 'L', list(zip(xs, ys)) if len(ts) else [], ts)
-def intersections_orbit_out(phi):
-    ts = find_roots(H_line_orbit_out, phi, t_orb_out_eps[0], t_orb_out_eps[1])
-    if len(ts):
-        xloc, yloc = orb_out_local(np.array(ts))
-        xs, ys = translate_orbit(xloc, yloc, phi); xy = list(zip(xs, ys))
-    else:
-        xy = []
-    return sort_by_halfline(phi, 'L', xy, ts)
-def intersections_fixed_out(phi):
-    ts = find_roots(H_line_fixed_out, phi, t_fix_out_eps[0], t_fix_out_eps[1])
-    xs, ys = stat_out(np.array(ts)) if len(ts) else (np.array([]), np.array([]))
-    return sort_by_halfline(phi, 'R', list(zip(xs, ys)) if len(ts) else [], ts)
-def intersections_orbit_in(phi):
-    ts = find_roots(H_line_orbit_in, phi, t_orb_in_eps[0], t_orb_in_eps[1])
-    if len(ts):
-        xloc, yloc = orb_in_local(np.array(ts))
-        xs, ys = translate_orbit(xloc, yloc, phi); xy = list(zip(xs, ys))
-    else:
-        xy = []
-    return sort_by_halfline(phi, 'R', xy, ts)
+    # Green-form analytic pieces
+    def area_line_seg(p, q): return 0.5 * (p[0]*q[1] - p[1]*q[0])
+    def Mx_line_seg(p, q):   return ((p[0] + q[0]) / 3.0) * area_line_seg(p, q)
+    def My_line_seg(p, q):   return ((p[1] + q[1]) / 3.0) * area_line_seg(p, q)
 
-# ===== Analytic centerline areas (Green decomposition) =====
-def area_line_seg(p, q): return 0.5 * (p[0]*q[1] - p[1]*q[0])
+    def A_stat_center(t0, t1): return (r*r/6.0) * (t1**3 - t0**3)
+    def F_stat_Mx(t):
+        return (r**3/3.0)*( t**3*np.sin(t) + 4.0*t**2*np.cos(t) - 8.0*t*np.sin(t) - 8.0*np.cos(t) )
+    def F_stat_My(t):
+        return (r**3/3.0)*( -t**3*np.cos(t) + 4.0*t**2*np.sin(t) + 8.0*t*np.cos(t) - 8.0*np.sin(t) )
+    def Mx_stat_center(t0, t1): return F_stat_Mx(t1) - F_stat_Mx(t0)
+    def My_stat_center(t0, t1): return F_stat_My(t1) - F_stat_My(t0)
 
-def A_stat_center(t0, t1): return (r*r/6.0) * (t1**3 - t0**3)
-def A_orb_center(t0, t1, phi):
-    base = (r*r/6.0) * (t1**3 - t0**3)
-    def F(t): return t*sin(phi + t) + cos(phi + t)
-    trans = -0.5 * E * r * (F(t1) - F(t0))
-    return base + trans
+    def F_stat_S1(t):
+        return (r**2)*((t**3)/6.0 + (t**2)*np.sin(2*t)/4.0 + t*np.cos(2*t)/2.0 - np.sin(2*t)/4.0)
+    def F_stat_S2(t):
+        return (r**2)*(-(t**3)/6.0 + (t**2)*np.sin(2*t)/4.0 + t*np.cos(2*t)/2.0 - np.sin(2*t)/4.0)
+    def S1_stat(t0, t1): return F_stat_S1(t1) - F_stat_S1(t0)
+    def S2_stat(t0, t1): return F_stat_S2(t1) - F_stat_S2(t0)
 
-def Mx_line_seg(p, q): return ((p[0] + q[0]) / 3.0) * area_line_seg(p, q)
-def My_line_seg(p, q): return ((p[1] + q[1]) / 3.0) * area_line_seg(p, q)
+    def A_orb_center(t0, t1, phi):
+        base = (r*r/6.0) * (t1**3 - t0**3)
+        def F(t): return t*np.sin(phi + t) + np.cos(phi + t)
+        trans = -0.5 * E * r * (F(t1) - F(t0))
+        return base + trans
+    def Mx_orb_center(t0, t1, phi):
+        X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
+        p = P_stat_center(t0); q = P_stat_center(t1)
+        dx = q[0] - p[0]; dy = q[1] - p[1]; dx2 = q[0]**2 - p[0]**2
+        return (- Mx_stat_center(t0, t1)
+                + (2*X0*S1_stat(t0,t1) - X0*S2_stat(t0,t1) - 0.5*Y0*dx2 - (X0**2)*dy + X0*Y0*dx)/3.0)
+    def My_orb_center(t0, t1, phi):
+        X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
+        p = P_stat_center(t0); q = P_stat_center(t1)
+        dx = q[0] - p[0]; dy = q[1] - p[1]; dy2 = q[1]**2 - p[1]**2
+        return (- My_stat_center(t0, t1)
+                + (0.5*X0*dy2 + Y0*S1_stat(t0,t1) - X0*Y0*dy - 2*Y0*S2_stat(t0,t1) + (Y0**2)*dx)/3.0)
 
-def F_stat_Mx(t):
-    return (r**3/3.0)*( t**3*sin(t) + 4.0*t**2*cos(t) - 8.0*t*sin(t) - 8.0*cos(t) )
-def F_stat_My(t):
-    return (r**3/3.0)*( -t**3*cos(t) + 4.0*t**2*sin(t) + 8.0*t*cos(t) - 8.0*sin(t) )
-def Mx_stat_center(t0, t1): return F_stat_Mx(t1) - F_stat_Mx(t0)
-def My_stat_center(t0, t1): return F_stat_My(t1) - F_stat_My(t0)
+    # suction patch
+    PATCH_AREA = variant["PATCH_AREA"]
+    PATCH_CX   = variant["PATCH_CX"]
+    PATCH_CY   = variant["PATCH_CY"]
 
-def F_stat_S1(t):
-    return (r**2)*((t**3)/6.0 + (t**2)*sin(2*t)/4.0 + t*cos(2*t)/2.0 - sin(2*t)/4.0)
-def F_stat_S2(t):
-    return (r**2)*(-(t**3)/6.0 + (t**2)*sin(2*t)/4.0 + t*cos(2*t)/2.0 - sin(2*t)/4.0)
-def S1_stat(t0, t1): return F_stat_S1(t1) - F_stat_S1(t0)
-def S2_stat(t0, t1): return F_stat_S2(t1) - F_stat_S2(t0)
+    # clamp helper
+    def clamp(t, tmin, tmax): return max(tmin, min(tmax, t))
 
-def Mx_orb_center(t0, t1, phi):
-    X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
-    p = P_stat_center(t0); q = P_stat_center(t1)
-    dx = q[0] - p[0]; dy = q[1] - p[1]; dx2 = q[0]**2 - p[0]**2
-    return (- Mx_stat_center(t0, t1)
-            + (2*X0*S1_stat(t0,t1) - X0*S2_stat(t0,t1) - 0.5*Y0*dx2 - (X0**2)*dy + X0*Y0*dx)/3.0)
-def My_orb_center(t0, t1, phi):
-    X0, Y0 = E*np.cos(phi), -E*np.sin(phi)
-    p = P_stat_center(t0); q = P_stat_center(t1)
-    dx = q[0] - p[0]; dy = q[1] - p[1]; dy2 = q[1]**2 - p[1]**2
-    return (- My_stat_center(t0, t1)
-            + (0.5*X0*dy2 + Y0*S1_stat(t0,t1) - X0*Y0*dy - 2*Y0*S2_stat(t0,t1) + (Y0**2)*dx)/3.0)
+    # Pairing helpers
+    def common_pairs(s_fix, t_fix, s_orb, t_orb, tol=5e-4, use_abs=False):
+        i=j=0; pairs=[]
+        while i<len(s_fix) and j<len(s_orb):
+            sf = abs(s_fix[i]) if use_abs else s_fix[i]
+            so = abs(s_orb[j]) if use_abs else s_orb[j]
+            d = sf - so
+            if abs(d) <= tol:
+                pairs.append((i,j)); i+=1; j+=1
+            elif d < 0: i+=1
+            else:       j+=1
+        return pairs  # [(iF,jO), ...] inner->outer
 
-# ===== Sampling helpers =====
-def poly_area_centroid(points):
-    if len(points) < 3:
-        return 0.0, np.nan, np.nan
-    x = np.array([p[0] for p in points]); y = np.array([p[1] for p in points])
-    x1 = np.roll(x, -1); y1 = np.roll(y, -1)
-    cross = x*y1 - y*x1
-    A_signed = 0.5 * np.sum(cross)
-    if abs(A_signed) < 1e-15:
-        return 0.0, np.nan, np.nan
-    Cx = (1.0/(6.0*A_signed)) * np.sum((x + x1) * cross)
-    Cy = (1.0/(6.0*A_signed)) * np.sum((y + y1) * cross)
-    A = abs(A_signed)
-    return A, Cx, Cy
+    # Chambers A
+    def chambers_A_props(phi):
+        tF, _, sF = intersections_fixed_in(phi)
+        tO, _, sO = intersections_orbit_out(phi)
+        if len(tF)==0 or len(tO)==0: return []
+        tF_c = [clamp(t, t_fix_in_raw[0],  t_fix_in_raw[1]) for t in tF]
+        tO_c = [clamp(t, t_orb_out_raw[0], t_orb_out_raw[1]) for t in tO]
+        pairs = common_pairs(sF, tF_c, sO, tO_c, tol=5e-4, use_abs=False)
+        out=[]
+        for k in range(len(pairs)-1):
+            i1,j1 = pairs[k]; i2,j2 = pairs[k+1]
+            t1, t2 = tF_c[i1], tF_c[i2]
+            s1, s2 = tO_c[j1], tO_c[j2]
+            P1o, P1f = P_orb_center(s1,phi), P_stat_center(t1)
+            P2f, P2o = P_stat_center(t2),   P_orb_center(s2,phi)
+            A  = area_line_seg(P1o, P1f) + A_stat_center(t1, t2) + area_line_seg(P2f, P2o) + A_orb_center(s2, s1, phi)
+            Mx = Mx_line_seg(P1o, P1f)   + Mx_stat_center(t1, t2) + Mx_line_seg(P2f, P2o)   + Mx_orb_center(s2, s1, phi)
+            My = My_line_seg(P1o, P1f)   + My_stat_center(t1, t2) + My_line_seg(P2f, P2o)   + My_orb_center(s2, s1, phi)
+            if A < 0: A, Mx, My = -A, -Mx, -My
+            out.append(dict(area=A, cx=Mx/A if abs(A)>1e-12 else np.nan, cy=My/A if abs(A)>1e-12 else np.nan))
+        return out[::-1]  # A1 outermost first
 
-def sample_stat_center(t0, t1, N=600):
-    ts = np.linspace(t0, t1, max(2, N)); return [tuple(P_stat_center(t)) for t in ts]
-def sample_orb_center(t0, t1, phi, N=600):
-    ts = np.linspace(t0, t1, max(2, N)); return [tuple(P_orb_center(t, phi)) for t in ts]
-def sample_stat_in(t0, t1, N=600):
-    ts = np.linspace(t0, t1, max(2, N)); x,y = stat_in(ts);  return list(zip(x, y))
-def sample_stat_out(t0, t1, N=600):
-    ts = np.linspace(t0, t1, max(2, N)); x,y = stat_out(ts); return list(zip(x, y))
-def sample_orb_out_global(s0, s1, phi, N=600):
-    ts = np.linspace(s0, s1, max(2, N)); xloc,yloc = orb_out_local(ts); x,y = translate_orbit(xloc, yloc, phi); return list(zip(x, y))
-def sample_orb_in_global(s0, s1, phi, N=600):
-    ts = np.linspace(s0, s1, max(2, N)); xloc,yloc = orb_in_local(ts);  x,y = translate_orbit(xloc, yloc, phi);  return list(zip(x, y))
+    # Chambers B
+    def chambers_B_props(phi):
+        tF, _, sF = intersections_fixed_out(phi)
+        tO, _, sO = intersections_orbit_in(phi)
+        if len(tF)==0 or len(tO)==0: return []
+        tF_c = [clamp(t, t_fix_out_raw[0], t_fix_out_raw[1]) for t in tF]
+        tO_c = [clamp(t, t_orb_in_raw[0],  t_orb_in_raw[1])  for t in tO]
+        pairs = common_pairs(sF, tF_c, sO, tO_c, tol=5e-4, use_abs=True)
+        out=[]
+        for k in range(len(pairs)-1):
+            i1,j1 = pairs[k]; i2,j2 = pairs[k+1]
+            t1, t2 = tF_c[i1], tF_c[i2]
+            s1, s2 = tO_c[j1], tO_c[j2]
+            P1o, P1f = P_orb_center(s1,phi), P_stat_center(t1)
+            P2f, P2o = P_stat_center(t2),   P_orb_center(s2,phi)
+            A  = area_line_seg(P1o, P1f) + A_stat_center(t1, t2) + area_line_seg(P2f, P2o) + A_orb_center(s2, s1, phi)
+            Mx = Mx_line_seg(P1o, P1f)   + Mx_stat_center(t1, t2) + Mx_line_seg(P2f, P2o)   + Mx_orb_center(s2, s1, phi)
+            My = My_line_seg(P1o, P1f)   + My_stat_center(t1, t2) + My_line_seg(P2f, P2o)   + My_orb_center(s2, s1, phi)
+            if A < 0: A, Mx, My = -A, -Mx, -My
+            out.append(dict(area=A, cx=Mx/A if abs(A)>1e-12 else np.nan, cy=My/A if abs(A)>1e-12 else np.nan))
+        return out[::-1]  # B1 outermost first
 
-# ===== Chambers with CLAMP to RAW =====
-def chambers_A_centerline(phi):
-    t_fix, _, _ = intersections_fixed_in(phi)
-    t_orb, _, _ = intersections_orbit_out(phi)
-    n = max(0, min(len(t_fix), len(t_orb)) - 1)
-    out = []
-    for j in range(n):
-        tf1 = clamp(t_fix[j],   t_fix_in_raw[0],  t_fix_in_raw[1])
-        tf2 = clamp(t_fix[j+1], t_fix_in_raw[0],  t_fix_in_raw[1])
-        to1 = clamp(t_orb[j],   t_orb_out_raw[0], t_orb_out_raw[1])
-        to2 = clamp(t_orb[j+1], t_orb_out_raw[0], t_orb_out_raw[1])
-        PF1, PF2 = P_stat_center(tf1), P_stat_center(tf2)
-        PO1, PO2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
-        A  = area_line_seg(PO1, PF1) + A_stat_center(tf1, tf2) + area_line_seg(PF2, PO2) + A_orb_center(to2, to1, phi)
-        Mx = Mx_line_seg(PO1, PF1)   + Mx_stat_center(tf1, tf2) + Mx_line_seg(PF2, PO2)   + Mx_orb_center(to2, to1, phi)
-        My = My_line_seg(PO1, PF1)   + My_stat_center(tf1, tf2) + My_line_seg(PF2, PO2)   + My_orb_center(to2, to1, phi)
+    # C1 (inner-most common pair on each side)
+    def chamber_C1_props(phi):
+        t_fix_L, _, s_fixL = intersections_fixed_in(phi)
+        t_orb_L, _, s_orbL = intersections_orbit_out(phi)
+        t_fix_R, _, s_fixR = intersections_fixed_out(phi)
+        t_orb_R, _, s_orbR = intersections_orbit_in(phi)
+        if (len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0):
+            return dict(area=np.nan, cx=np.nan, cy=np.nan, theta_sum=np.nan, pL=None, pR=None)
+        t_fix_L = [clamp(t, t_fix_in_raw[0],  t_fix_in_raw[1]) for t in t_fix_L]
+        t_orb_L = [clamp(t, t_orb_out_raw[0], t_orb_out_raw[1]) for t in t_orb_L]
+        t_fix_R = [clamp(t, t_fix_out_raw[0], t_fix_out_raw[1]) for t in t_fix_R]
+        t_orb_R = [clamp(t, t_orb_in_raw[0],  t_orb_in_raw[1])  for t in t_orb_R]
+        pairsL = common_pairs(s_fixL, t_fix_L, s_orbL, t_orb_L, tol=5e-4, use_abs=False)
+        pairsR = common_pairs(s_fixR, t_fix_R, s_orbR, t_orb_R, tol=5e-4, use_abs=True)
+        if len(pairsL)==0 or len(pairsR)==0:
+            return dict(area=np.nan, cx=np.nan, cy=np.nan, theta_sum=np.nan, pL=None, pR=None)
+        iL,jL = pairsL[0]; iR,jR = pairsR[0]
+        tL, sL = t_fix_L[iL], t_orb_L[jL]
+        tR, sR = t_fix_R[iR], t_orb_R[jR]
+        P_stat_L, P_stat_R = P_stat_center(tL), P_stat_center(tR)
+        P_orb_L,  P_orb_R  = P_orb_center(sL, phi), P_orb_center(sR, phi)
+        # area & centroid
+        A  = area_line_seg(P_stat_L, P_orb_L) + A_orb_center(sL, sR, phi) \
+           + area_line_seg(P_orb_R, P_stat_R) + A_stat_center(tR, tL)
+        Mx = Mx_line_seg(P_stat_L, P_orb_L) + Mx_orb_center(sL, sR, phi) \
+           + Mx_line_seg(P_orb_R, P_stat_R) + Mx_stat_center(tR, tL)
+        My = My_line_seg(P_stat_L, P_orb_L) + My_orb_center(sL, sR, phi) \
+           + My_line_seg(P_orb_R, P_stat_R) + My_stat_center(tR, tL)
         if A < 0: A, Mx, My = -A, -Mx, -My
-        out.append((A, Mx/A, My/A))
+        # θ1+θ2 via geometry
+        d = np.linalg.norm(P_stat_R - P_stat_L)
+        theta_sum = np.sqrt(max(d*d - (2*Rg)**2, 0.0)) / Rg
+        return dict(area=A, cx=Mx/A if A>1e-12 else np.nan, cy=My/A if A>1e-12 else np.nan,
+                    theta_sum=theta_sum, pL=P_stat_L, pR=P_stat_R)
+
+    # Suction (fixed CCW chain along centerlines + patch)
+    def suction_props_ccw(phi):
+        t_fix_L, _, _ = intersections_fixed_in(phi)
+        t_orb_L, _, _ = intersections_orbit_out(phi)
+        t_fix_R, _, _ = intersections_fixed_out(phi)
+        t_orb_R, _, _ = intersections_orbit_in(phi)
+        if (len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0):
+            return dict(area=np.nan, cx=np.nan, cy=np.nan)
+        tfL = max(min(t_fix_L[-1], t_fix_in_raw[1]), t_fix_in_raw[0])
+        toL = max(min(t_orb_L[-1], t_orb_out_raw[1]), t_orb_out_raw[0])
+        tfR = max(min(t_fix_R[-1], t_fix_out_raw[1]), t_fix_out_raw[0])
+        toR = max(min(t_orb_R[-1], t_orb_in_raw[1]),  t_orb_in_raw[0])
+
+        tf_in_end  = t_fix_in_raw[1]
+        tf_out_end = t_fix_out_raw[1]
+        to_in_end  = t_orb_in_raw[1]
+        to_out_end = t_orb_out_raw[1]
+
+        P_tfL      = P_stat_center(tfL)
+        P_tf_inEnd = P_stat_center(tf_in_end)
+        P_tf_outEnd= P_stat_center(tf_out_end)
+        P_tfR      = P_stat_center(tfR)
+        P_toR      = P_orb_center(toR, phi)
+        P_to_inEnd = P_orb_center(to_in_end, phi)
+        P_to_outEnd= P_orb_center(to_out_end, phi)
+        P_toL      = P_orb_center(toL, phi)
+
+        A = 0.0; Mx=0.0; My=0.0
+        # stat_in: tfL -> tf_in_end
+        A += A_stat_center(tfL, tf_in_end);  Mx += Mx_stat_center(tfL, tf_in_end);  My += My_stat_center(tfL, tf_in_end)
+        # line: in_end -> out_end
+        A += area_line_seg(P_tf_inEnd, P_tf_outEnd); Mx += Mx_line_seg(P_tf_inEnd, P_tf_outEnd); My += My_line_seg(P_tf_inEnd, P_tf_outEnd)
+        # stat_out: out_end -> tfR
+        A += A_stat_center(tf_out_end, tfR); Mx += Mx_stat_center(tf_out_end, tfR); My += My_stat_center(tf_out_end, tfR)
+        # line: tfR -> toR
+        A += area_line_seg(P_tfR, P_toR); Mx += Mx_line_seg(P_tfR, P_toR); My += My_line_seg(P_tfR, P_toR)
+        # orb_in: toR -> to_in_end
+        A += A_orb_center(toR, to_in_end, phi); Mx += Mx_orb_center(toR, to_in_end, phi); My += My_orb_center(toR, to_in_end, phi)
+        # line: to_in_end -> to_out_end
+        A += area_line_seg(P_to_inEnd, P_to_outEnd); Mx += Mx_line_seg(P_to_inEnd, P_to_outEnd); My += My_line_seg(P_to_inEnd, P_to_outEnd)
+        # orb_out: to_out_end -> toL
+        A += A_orb_center(to_out_end, toL, phi); Mx += Mx_orb_center(to_out_end, toL, phi); My += My_orb_center(to_out_end, toL, phi)
+        # line: toL -> tfL
+        A += area_line_seg(P_toL, P_tfL); Mx += Mx_line_seg(P_toL, P_tfL); My += My_line_seg(P_toL, P_tfL)
+        if A < 0: A, Mx, My = -A, -Mx, -My
+
+        A_tot = A + PATCH_AREA
+        Cx = (Mx + PATCH_AREA*PATCH_CX) / A_tot if A_tot>1e-12 else np.nan
+        Cy = (My + PATCH_AREA*PATCH_CY) / A_tot if A_tot>1e-12 else np.nan
+        return dict(area=A_tot, cx=Cx, cy=Cy)
+
+    return dict(
+        Rg=Rg, r=r, T=T, E=E, phi0_deg=phi0_deg,
+        P_stat_center=P_stat_center, P_orb_center=P_orb_center,
+        intersections_fixed_in=intersections_fixed_in,
+        intersections_orbit_out=intersections_orbit_out,
+        intersections_fixed_out=intersections_fixed_out,
+        intersections_orbit_in=intersections_orbit_in,
+        A_stat_center=A_stat_center, A_orb_center=A_orb_center,
+        Mx_stat_center=Mx_stat_center, My_stat_center=My_stat_center,
+        Mx_orb_center=Mx_orb_center, My_orb_center=My_orb_center,
+        area_line_seg=area_line_seg, Mx_line_seg=Mx_line_seg, My_line_seg=My_line_seg,
+        chambers_A_props=chambers_A_props, chambers_B_props=chambers_B_props,
+        chamber_C1_props=chamber_C1_props, suction_props_ccw=suction_props_ccw,
+        u_dir=u_dir, n_perp=n_perp
+    )
+
+# ----------------------------- Pressure model -----------------------------
+def baseline_areas_for_adiabatic(geom, variant):
+    """Capture starting areas for adiabatic: B side at 0°, A side at 180° (suction is not in these baselines)."""
+    phi0 = np.deg2rad(geom["phi0_deg"] + 0.0)
+    phi180 = np.deg2rad(geom["phi0_deg"] + 180.0)
+
+    Ab = geom["chambers_A_props"](phi180)  # A1.. (no suction inserted here)
+    Bb = geom["chambers_B_props"](phi0)    # B1..
+
+    return dict(
+        A2=Ab[1]["area"] if len(Ab)>1 else np.nan,
+        A3=Ab[2]["area"] if len(Ab)>2 else np.nan,
+        B2=Bb[1]["area"] if len(Bb)>1 else np.nan
+    )
+
+def chamber_pressures(phi_deg_rel, A_pack, B_pack, C1, baseline, variant):
+    """Return dict of pressures per chamber name at this angle.
+       - suction is always P_suction_MP
+       - compressing rooms: adiabatic from baseline areas (A at 180°, B at 0°).
+       - C1 is variant["P_C1_MP"].
+    """
+    P_s = variant["P_suction_MP"]
+    gamma = variant["GAMMA"]
+    P_C = variant["P_C1_MP"]
+    out = {}
+
+    # A side
+    if len(A_pack)>0: out["A1"] = P_s  # A1 is suction if deg>=180
+    if len(A_pack)>1 and not np.isnan(baseline.get("A2", np.nan)) and A_pack[1]["area"]>1e-9:
+        out["A2"] = P_s * (baseline["A2"]/A_pack[1]["area"])**gamma
+    if len(A_pack)>2 and not np.isnan(baseline.get("A3", np.nan)) and A_pack[2]["area"]>1e-9:
+        out["A3"] = P_s * (baseline["A3"]/A_pack[2]["area"])**gamma
+
+    # B side
+    if len(B_pack)>0: out["B1"] = P_s  # B1 is suction if deg<180
+    if len(B_pack)>1 and not np.isnan(baseline.get("B2", np.nan)) and B_pack[1]["area"]>1e-9:
+        out["B2"] = P_s * (baseline["B2"]/B_pack[1]["area"])**gamma
+
+    # C1
+    if not np.isnan(C1["area"]) and C1["area"]>0:
+        out["C1"] = P_C
+
     return out
 
-def chambers_B_centerline(phi):
-    t_fix, _, _ = intersections_fixed_out(phi)
-    t_orb, _, _ = intersections_orbit_in(phi)
-    n = max(0, min(len(t_fix), len(t_orb)) - 1)
+# ----------------------------- Forces & Moments -----------------------------
+def ring_origins(phi, variant, geom, deg_step2=10.0):
+    """36 points on circle around orbit center: Oj = E*[cosφ, -sinφ] + Rm*[cos(φ+θ), -sin(φ+θ)]"""
+    E = geom["E"]; Rm = variant["mirror_radius"]
+    phibase = phi
     out = []
-    for j in range(n):
-        tf1 = clamp(t_fix[j],   t_fix_out_raw[0], t_fix_out_raw[1])
-        tf2 = clamp(t_fix[j+1], t_fix_out_raw[0], t_fix_out_raw[1])
-        to1 = clamp(t_orb[j],   t_orb_in_raw[0],  t_orb_in_raw[1])
-        to2 = clamp(t_orb[j+1], t_orb_in_raw[0],  t_orb_in_raw[1])
-        PF1, PF2 = P_stat_center(tf1), P_stat_center(tf2)
-        PO1, PO2 = P_orb_center(to1, phi), P_orb_center(to2, phi)
-        A  = area_line_seg(PO1, PF1) + A_stat_center(tf1, tf2) + area_line_seg(PF2, PO2) + A_orb_center(to2, to1, phi)
-        Mx = Mx_line_seg(PO1, PF1)   + Mx_stat_center(tf1, tf2) + Mx_line_seg(PF2, PO2)   + Mx_orb_center(to2, to1, phi)
-        My = My_line_seg(PO1, PF1)   + My_stat_center(tf1, tf2) + My_line_seg(PF2, PO2)   + My_orb_center(to2, to1, phi)
-        if A < 0: A, Mx, My = -A, -Mx, -My
-        out.append((A, Mx/A, My/A))
+    for j in range(int(360/deg_step2)):
+        th = phibase + math.radians(j*deg_step2)
+        x = E*math.cos(phi) + Rm*math.cos(th)
+        y = -E*math.sin(phi) - Rm*math.sin(th)
+        out.append(np.array([x,y]))
     return out
 
-def chamber_C1_centerline(phi):
-    t_fix_L, _, _ = intersections_fixed_in(phi)
-    t_orb_L, _, _ = intersections_orbit_out(phi)
-    t_fix_R, _, _ = intersections_fixed_out(phi)
-    t_orb_R, _, _ = intersections_orbit_in(phi)
-    if len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0:
-        return np.nan, np.nan, np.nan
-    tL = clamp(t_fix_L[0], t_fix_in_raw[0],  t_fix_in_raw[1])
-    tR = clamp(t_fix_R[0], t_fix_out_raw[0], t_fix_out_raw[1])
-    sL = clamp(t_orb_L[0], t_orb_out_raw[0], t_orb_out_raw[1])
-    sR = clamp(t_orb_R[0], t_orb_in_raw[0],  t_orb_in_raw[1])
-    P_stat_L, P_stat_R = P_stat_center(tL), P_stat_center(tR)
-    P_orb_L,  P_orb_R  = P_orb_center(sL, phi), P_orb_center(sR, phi)
-    A  = area_line_seg(P_stat_L, P_orb_L) + A_orb_center(sL, sR, phi) + area_line_seg(P_orb_R, P_stat_R) + A_stat_center(tR, tL)
-    Mx = Mx_line_seg(P_stat_L, P_orb_L)   + Mx_orb_center(sL, sR, phi) + Mx_line_seg(P_orb_R, P_stat_R)   + Mx_stat_center(tR, tL)
-    My = My_line_seg(P_stat_L, P_orb_L)   + My_orb_center(sL, sR, phi) + My_line_seg(P_orb_R, P_stat_R)   + My_stat_center(tR, tL)
-    if A < 0: A, Mx, My = -A, -Mx, -My
-    return A, Mx/A, My/A
+def radial_unit_from_Oj(Oj):
+    v = -Oj  # (0,0) - Oj  => "離れる向き"
+    n = np.linalg.norm(v)
+    return v / n if n>0 else np.array([1.0, 0.0])
 
-# ===== Suction (centerline + patch), using RAW endpoints =====
-def suction_centerline_v1(phi):
-    t_fix_L, _, _ = intersections_fixed_in(phi)
-    t_orb_L, _, _ = intersections_orbit_out(phi)
-    t_fix_R, _, _ = intersections_fixed_out(phi)
-    t_orb_R, _, _ = intersections_orbit_in(phi)
-    if len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0:
-        return np.nan, np.nan, np.nan
-    tfL = clamp(t_fix_L[-1], t_fix_in_raw[0],  t_fix_in_raw[1])
-    toL = clamp(t_orb_L[-1], t_orb_out_raw[0], t_orb_out_raw[1])
-    tfR = clamp(t_fix_R[-1], t_fix_out_raw[0], t_fix_out_raw[1])
-    toR = clamp(t_orb_R[-1], t_orb_in_raw[0],  t_orb_in_raw[1])
-    tf_in_end  = t_fix_in_raw[1]
-    tf_out_end = t_fix_out_raw[1]
-    to_out_end = t_orb_out_raw[1]
-    to_in_end  = t_orb_in_raw[1]
+def top_thrust_moment_scalar(A_pack, B_pack, C1, pressures, Oj, n_dir):
+    """Downward forces from all pockets (suction included)."""
+    mvec = np.array([0.0,0.0])
+    def add(area, cx, cy, P):
+        if np.isnan(area) or area<=0 or np.isnan(P): return
+        F = P * area  # N
+        r = np.array([cx - Oj[0], cy - Oj[1], 0.0])
+        m = np.array([-F*r[1], F*r[0]])  # r x (0,0,-F) = (-F*ry, F*rx)
+        return m
+    # A
+    for idx, nm in enumerate(["A1","A2","A3"]):
+        if idx < len(A_pack) and nm in pressures:
+            m = add(A_pack[idx]["area"], A_pack[idx]["cx"], A_pack[idx]["cy"], pressures[nm])
+            if m is not None: mvec += m
+    # B
+    for idx, nm in enumerate(["B1","B2"]):
+        if idx < len(B_pack) and nm in pressures:
+            m = add(B_pack[idx]["area"], B_pack[idx]["cx"], B_pack[idx]["cy"], pressures[nm])
+            if m is not None: mvec += m
+    # C
+    if "C1" in pressures and not np.isnan(C1["area"]):
+        m = add(C1["area"], C1["cx"], C1["cy"], pressures["C1"])
+        if m is not None: mvec += m
+    return float(mvec @ n_dir)
 
-    pts = []
-    pts += sample_stat_center(tfL, tf_in_end, N=500)
-    pts.append(tuple(P_stat_center(tf_out_end)))
-    pts += sample_stat_center(tf_out_end, tfR, N=500)
-    pts.append(tuple(P_orb_center(toR, phi)))
-    pts += sample_orb_center(toR, to_in_end, phi, N=500)
-    pts.append(tuple(P_orb_center(to_out_end, phi)))
-    pts += sample_orb_center(to_out_end, toL, phi, N=500)
-    pts.append(tuple(P_stat_center(tfL)))
-    A_poly, Cx_poly, Cy_poly = poly_area_centroid(pts)
-    A_total = A_poly + PATCH_AREA
-    Cx = (A_poly*Cx_poly + PATCH_AREA*PATCH_CX)/A_total
-    Cy = (A_poly*Cy_poly + PATCH_AREA*PATCH_CY)/A_total
-    return A_total, Cx, Cy
+def bottom_thrust_moment_scalar(variant, Oj, n_dir, area_sum, pressures):
+    """Upward (stabilizing) forces from back-pressure zones."""
+    P_middle = variant["P_middle"]
+    P_C1 = pressures.get("C1", variant["P_C1_MP"])
+    p_m = variant["p_m_point"]
+    p_seal = variant["P_seal_point"]
+    A_seal = math.pi * (variant["seal_radius"]**2)
 
-def suction_centerline_v2(phi):
-    # alternative ordering to avoid occasional self-overlap
-    t_fix_L, _, _ = intersections_fixed_in(phi)
-    t_orb_L, _, _ = intersections_orbit_out(phi)
-    t_fix_R, _, _ = intersections_fixed_out(phi)
-    t_orb_R, _, _ = intersections_orbit_in(phi)
-    if len(t_fix_L)==0 or len(t_orb_L)==0 or len(t_fix_R)==0 or len(t_orb_R)==0:
-        return np.nan, np.nan, np.nan
-    tfL = clamp(t_fix_L[-1], t_fix_in_raw[0],  t_fix_in_raw[1])
-    toL = clamp(t_orb_L[-1], t_orb_out_raw[0], t_orb_out_raw[1])
-    tfR = clamp(t_fix_R[-1], t_fix_out_raw[0], t_fix_out_raw[1])
-    toR = clamp(t_orb_R[-1], t_orb_in_raw[0],  t_orb_in_raw[1])
-    tf_in_end  = t_fix_in_raw[1]
-    tf_out_end = t_fix_out_raw[1]
-    to_out_end = t_orb_out_raw[1]
-    to_in_end  = t_orb_in_raw[1]
+    mvec = np.array([0.0,0.0])
+    def add(F, px, py):
+        r = np.array([px - Oj[0], py - Oj[1], 0.0])
+        m = np.array([ F*r[1], -F*r[0] ])  # r x (0,0,+F)
+        return m
 
-    pts = []
-    pts += [tuple(P_stat_center(tfL))]
-    pts += sample_stat_center(tfL, tf_in_end, N=500)
-    pts += [tuple(P_orb_center(to_out_end, phi))]
-    pts += sample_orb_center(to_out_end, toL, phi, N=500)
-    pts += [tuple(P_stat_center(tfR))]
-    pts += sample_stat_center(tfR, tf_out_end, N=500)
-    pts += [tuple(P_orb_center(to_in_end, phi))]
-    pts += sample_orb_center(to_in_end, toR, phi, N=500)
-    A_poly, Cx_poly, Cy_poly = poly_area_centroid(pts)
-    A_total = A_poly + PATCH_AREA
-    Cx = (A_poly*Cx_poly + PATCH_AREA*PATCH_CX)/A_total
-    Cy = (A_poly*Cy_poly + PATCH_AREA*PATCH_CY)/A_total
-    return A_total, Cx, Cy
+    if area_sum>0 and P_middle>0:
+        Fm = P_middle * area_sum
+        mvec += add(Fm, p_m[0], p_m[1])
 
-# ===== Sweep with constancy check =====
-ENFORCE_CONST = True
-TOL_CONST = 0.2  # mm^2
+    if (P_C1 - P_middle) != 0:
+        Fseal = (P_C1 - P_middle) * A_seal
+        mvec += add(Fseal, p_seal[0], p_seal[1])
 
-def sweep_R32_constancy(out_csv="/mnt/data/areas_R32_constancy_epssplit.csv", plot_png="/mnt/data/area_constancy_R32_epssplit.png"):
-    phis = [np.deg2rad(phi0_deg + deg_step*i) for i in range(num_steps)]
-    degs = [deg_step*i for i in range(num_steps)]
-    rows = []
+    # Stabilizing => negative寄与
+    return float(- (mvec @ n_dir))
 
-    # target total at first φ using v1 suction
-    phi0 = phis[0]
-    A0_list = chambers_A_centerline(phi0)[::-1]
-    B0_list = chambers_B_centerline(phi0)[::-1]
-    C10,_,_ = chamber_C1_centerline(phi0)
-    Su0,_,_ = suction_centerline_v1(phi0)
-    open0 = 'B' if degs[0] < 180.0 else 'A'
-    if open0=='A':
-        target_total = Su0 + sum([a for a,_,_ in A0_list]) + sum([a for a,_,_ in B0_list]) + (C10 if not np.isnan(C10) else 0.0)
-    else:
-        target_total = Su0 + sum([a for a,_,_ in B0_list]) + sum([a for a,_,_ in A0_list]) + (C10 if not np.isnan(C10) else 0.0)
+def lateral_force_vector(variant, geom, phi, pressures, A_pack, B_pack, C1):
+    """Net lateral force vector in XY from gas loads (radial + tangential)."""
+    Rg = geom["Rg"]
+    u = geom["u_dir"](phi)
+    n = geom["n_perp"](phi)
+    P_s = variant["P_suction_MP"]
+    # center pressure
+    P_C = pressures.get("C1", variant["P_C1_MP"])
 
-    for phi,deg in zip(phis,degs):
-        open_side = 'B' if deg < 180.0 else 'A'
-        A_list = chambers_A_centerline(phi)[::-1]
-        B_list = chambers_B_centerline(phi)[::-1]
-        C1A, C1cx, C1cy = chamber_C1_centerline(phi)
+    # Radial: opposite to u
+    F_rad_mag = 2*Rg*(P_C - P_s)
+    F_rad_vec = -F_rad_mag * u
 
-        Su1, Su1x, Su1y = suction_centerline_v1(phi)
-        Su2, Su2x, Su2y = suction_centerline_v2(phi)
+    # Tangential sum
+    def deltaP(name, pack, idx):
+        if idx < len(pack) and name in pressures:
+            return max(pressures[name] - P_s, 0.0)
+        return 0.0
 
-        base = sum([a for a,_,_ in A_list]) + sum([a for a,_,_ in B_list]) + (C1A if not np.isnan(C1A) else 0.0)
-        total1 = base + (Su1 if not np.isnan(Su1) else 0.0)
-        total2 = base + (Su2 if not np.isnan(Su2) else 0.0)
+    F_tan_mag = 0.0
+    # B side
+    F_tan_mag += deltaP("B1", B_pack, 0) * (2*math.pi*Rg)
+    F_tan_mag += deltaP("B2", B_pack, 1) * (2*math.pi*Rg)
+    # A side
+    F_tan_mag += deltaP("A1", A_pack, 0) * (2*math.pi*Rg)
+    F_tan_mag += deltaP("A2", A_pack, 1) * (2*math.pi*Rg)
+    F_tan_mag += deltaP("A3", A_pack, 2) * (2*math.pi*Rg)
+    # center
+    theta_sum = C1.get("theta_sum", np.nan)
+    if not np.isnan(theta_sum):
+        F_tan_mag += max(P_C - P_s, 0.0) * Rg * theta_sum
 
-        if abs(total1 - target_total) <= abs(total2 - target_total):
-            SuA, Sucx, Sucy, chosen = Su1, Su1x, Su1y, 'v1'; total = total1
+    F_tan_vec = F_tan_mag * n
+    return F_rad_vec + F_tan_vec  # (Fx, Fy)
+
+def lateral_moment_scalar(variant, geom, phi, Oj, n_dir, pressures, A_pack, B_pack, C1):
+    F_lat = lateral_force_vector(variant, geom, phi, pressures, A_pack, B_pack, C1)
+    # Height arm for overturning
+    h_arm = variant["h_wrap"]/2.0 + variant["h_mirror"] + variant["h_main_bearing"]/2.0
+    M_lat_vec = h_arm * np.array([-F_lat[1], F_lat[0]])  # ( -Fy, +Fx )*h_arm
+    return float(M_lat_vec @ n_dir), F_lat
+
+# ----------------------------- Directory builder -----------------------------
+def build_outdir(base_root, variant_name, variant, deg_step, deg_step2):
+    vs = variant_name.lower()
+    Ps = variant["P_suction_MP"]; Pd = variant["P_C1_MP"]; G = variant["GAMMA"]
+    Pm = variant["P_middle"]; Rm = variant["mirror_radius"]
+    harm = variant["h_wrap"]/2.0 + variant["h_mirror"] + variant["h_main_bearing"]/2.0
+    dir_name = f"sim_{vs}__Ps{Ps:.2f}_Pd{Pd:.2f}_G{G:.2f}_Pm{Pm:.2f}_Rm{Rm:.1f}_h{harm:.1f}_d{int(deg_step)}_d2{int(deg_step2)}"
+    outdir = os.path.join(base_root, dir_name)
+    plots_dir = os.path.join(outdir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    return outdir, plots_dir
+
+# ----------------------------- Sweep & Outputs -----------------------------
+def solve_and_export(variant_name="R290", deg_step=10.0, deg_step2=10.0,
+                     make_plots=True, base_root="/mnt/data"):
+    variant = VARIANTS[variant_name]
+    geom = build_geom(variant)
+
+    # Baselines for adiabatic
+    baselines = baseline_areas_for_adiabatic(geom, variant)
+
+    # Build directory using variant + Ps/Pd/etc.
+    outdir, plots_dir = build_outdir(base_root, variant_name, variant, deg_step, deg_step2)
+    csv_areas  = os.path.join(outdir, f"{variant_name}_areas_centroids_{int(deg_step)}deg.csv")
+    csv_worst  = os.path.join(outdir, f"{variant_name}_worst_moment_{int(deg_step)}deg.csv")
+    csv_forces = os.path.join(outdir, f"{variant_name}_forces_detailed_{int(deg_step)}deg.csv")
+
+    phis = [np.deg2rad(geom["phi0_deg"] + deg_step*i) for i in range(int(360/deg_step))]
+    phi_deg_rel = [deg_step*i for i in range(int(360/deg_step))]
+
+    rows_area = []
+    rows_worst = []
+    rows_force = []
+
+    for phi,deg in zip(phis, phi_deg_rel):
+        # rooms
+        A_rooms = geom["chambers_A_props"](phi)  # list of dict area,cx,cy (A1 first)
+        B_rooms = geom["chambers_B_props"](phi)  # B1 first
+        C1 = geom["chamber_C1_props"](phi)
+        Su = geom["suction_props_ccw"](phi)
+
+        # Insert suction
+        if deg >= 180.0:
+            A_pack = [dict(area=Su["area"], cx=Su["cx"], cy=Su["cy"])] + A_rooms
+            B_pack = B_rooms
         else:
-            SuA, Sucx, Sucy, chosen = Su2, Su2x, Su2y, 'v2'; total = total2
+            B_pack = [dict(area=Su["area"], cx=Su["cx"], cy=Su["cy"])] + B_rooms
+            A_pack = A_rooms
 
-        delta = 0.0
-        if ENFORCE_CONST and abs(total - target_total) > TOL_CONST:
-            SuA = (SuA if not np.isnan(SuA) else 0.0) + (target_total - total)
-            delta = (target_total - total)
-            total = base + SuA
+        # Pressures per chamber
+        pressures = chamber_pressures(deg, A_pack, B_pack, C1, baselines, variant)
 
-        if open_side=='A':
-            A_cl = [(SuA, Sucx, Sucy)] + A_list; B_cl = B_list
-        else:
-            B_cl = [(SuA, Sucx, Sucy)] + B_list; A_cl = A_list
+        # --- Areas CSV row --- (sum_area uses *calculated* pockets per angle)
+        total_area = (sum(d["area"] for d in A_pack) +
+                      sum(d["area"] for d in B_pack) +
+                      (C1["area"] if not np.isnan(C1["area"]) else 0.0))
+        area_row = dict(phi_deg=deg,
+                        # A side
+                        A1_area=A_pack[0]["area"] if len(A_pack)>0 else np.nan,
+                        A1_cx=A_pack[0]["cx"] if len(A_pack)>0 else np.nan,
+                        A1_cy=A_pack[0]["cy"] if len(A_pack)>0 else np.nan,
+                        A2_area=A_pack[1]["area"] if len(A_pack)>1 else np.nan,
+                        A2_cx=A_pack[1]["cx"] if len(A_pack)>1 else np.nan,
+                        A2_cy=A_pack[1]["cy"] if len(A_pack)>1 else np.nan,
+                        A3_area=A_pack[2]["area"] if len(A_pack)>2 else np.nan,
+                        A3_cx=A_pack[2]["cx"] if len(A_pack)>2 else np.nan,
+                        A3_cy=A_pack[2]["cy"] if len(A_pack)>2 else np.nan,
+                        # B side
+                        B1_area=B_pack[0]["area"] if len(B_pack)>0 else np.nan,
+                        B1_cx=B_pack[0]["cx"] if len(B_pack)>0 else np.nan,
+                        B1_cy=B_pack[0]["cy"] if len(B_pack)>0 else np.nan,
+                        B2_area=B_pack[1]["area"] if len(B_pack)>1 else np.nan,
+                        B2_cx=B_pack[1]["cx"] if len(B_pack)>1 else np.nan,
+                        B2_cy=B_pack[1]["cy"] if len(B_pack)>1 else np.nan,
+                        # C1
+                        C1_area=C1["area"], C1_cx=C1["cx"], C1_cy=C1["cy"],
+                        # Suction (ref)
+                        Su_area=Su["area"], Su_cx=Su["cx"], Su_cy=Su["cy"],
+                        # Total (from calculated pockets)
+                        sum_area=total_area)
+        rows_area.append(area_row)
 
-        rows.append({"phi_deg":deg, "open_side":open_side, "strategy":chosen, "delta_applied":delta,
-                     "sum_A": sum([a for a,_,_ in A_cl]), "sum_B": sum([a for a,_,_ in B_cl]),
-                     "C1": (C1A if not np.isnan(C1A) else 0.0), "sum_total": total})
+        # --- Forces (detailed) ---
+        # Downward force from compressing chambers only: A2/A3/B2/C1
+        Fz_comp = 0.0
+        if len(A_pack)>1 and "A2" in pressures: Fz_comp -= pressures["A2"]*A_pack[1]["area"]
+        if len(A_pack)>2 and "A3" in pressures: Fz_comp -= pressures["A3"]*A_pack[2]["area"]
+        if len(B_pack)>1 and "B2" in pressures: Fz_comp -= pressures["B2"]*B_pack[1]["area"]
+        if "C1" in pressures and not np.isnan(C1["area"]): Fz_comp -= pressures["C1"]*C1["area"]
 
-    df = pd.DataFrame(rows)
-    df.to_csv(out_csv, index=False)
+        # Upward force from back pressure (middle + seal)
+        area_sum = total_area
+        P_middle = variant["P_middle"]
+        P_C = pressures.get("C1", variant["P_C1_MP"])
+        Fz_back = 0.0
+        if area_sum>0 and P_middle>0: Fz_back += P_middle*area_sum
+        Fz_back += (P_C - P_middle) * (math.pi * (variant["seal_radius"]**2))
 
-    vals = df["sum_total"].to_numpy(dtype=float)
-    phideg = df["phi_deg"].to_numpy(dtype=float)
-    plt.figure()
-    plt.plot(phideg, vals - np.nanmean(vals), marker='o')
-    plt.axhline(0, linestyle='--')
-    plt.xlabel("phi_deg"); plt.ylabel("sum_total - mean [mm^2]")
-    plt.title("R32 area constancy (EPS only for intersections; areas use RAW)")
-    plt.grid(True); plt.savefig(plot_png, dpi=140, bbox_inches="tight"); plt.close()
+        # Lateral force vector
+        F_lat_vec = lateral_force_vector(variant, geom, phi, pressures, A_pack, B_pack, C1)
+        Fx_lat, Fy_lat = float(F_lat_vec[0]), float(F_lat_vec[1])
 
-    print("Constancy after clamp approach: min={:.6f}, max={:.6f}, mean={:.6f}, range={:.6f}".format(
-        float(np.nanmin(vals)), float(np.nanmax(vals)), float(np.nanmean(vals)), float(np.nanmax(vals)-np.nanmin(vals))
-    ))
-    return df
+        # total forces (x,y from lateral only; z from comp+back)
+        Fx_sum = Fx_lat
+        Fy_sum = Fy_lat
+        Fz_sum = Fz_comp + Fz_back  # net thrust
 
-if __name__ == "__main__":
-    sweep_R32_constancy()
+        rows_force.append(dict(phi_deg=deg,
+                               Fx_lat=Fx_lat, Fy_lat=Fy_lat,
+                               Fz_comp=Fz_comp, Fz_back=Fz_back,
+                               Fx_sum=Fx_sum, Fy_sum=Fy_sum, Fz_sum=Fz_sum))
+
+        # --- Moments on ring & plots ---
+        O_list = ring_origins(phi, variant, geom, deg_step2=deg_step2)
+        x_js = [j*deg_step2 for j in range(len(O_list))]
+        m_top_list, m_bot_list, m_lat_list, m_tot_list = [], [], [], []
+        for Oj in O_list:
+            n_dir = radial_unit_from_Oj(Oj)
+            m_top = top_thrust_moment_scalar(A_pack, B_pack, C1, pressures, Oj, n_dir)
+            m_bot = bottom_thrust_moment_scalar(variant, Oj, n_dir, area_sum, pressures)   # stabilizing negative
+            m_lat, _F = lateral_moment_scalar(variant, geom, phi, Oj, n_dir, pressures, A_pack, B_pack, C1)
+            m_tot = m_top + m_bot + m_lat
+            m_top_list.append(m_top); m_bot_list.append(m_bot); m_lat_list.append(m_lat); m_tot_list.append(m_tot)
+
+        # Worst j (largest total)
+        j_peak = int(np.argmax(m_tot_list))
+        peak_angle = x_js[j_peak]
+        peak_value = float(m_tot_list[j_peak])
+        rows_worst.append(dict(phi_deg=deg, worst_dir_deg=peak_angle, worst_moment_Nmm=peak_value))
+
+        # plot if requested
+        if make_plots:
+            plt.figure()
+            plt.plot(x_js, m_top_list, label="top (down)")
+            plt.plot(x_js, m_bot_list, label="bottom (up)")
+            plt.plot(x_js, m_lat_list, label="lateral")
+            plt.plot(x_js, m_tot_list, label="total")
+            plt.xlabel("direction on ring [deg]")
+            plt.ylabel("moment [N·mm]")
+            plt.title(f"{variant_name}  phi={deg:.0f}°")
+            plt.legend()
+            fn = os.path.join(plots_dir, f"moments_phi_{int(deg):03d}.png")
+            plt.savefig(fn, dpi=120, bbox_inches="tight")
+            plt.close()
+
+    # Save CSVs
+    df_area = pd.DataFrame(rows_area);  df_area.to_csv(csv_areas, index=False)
+    df_worst = pd.DataFrame(rows_worst); df_worst.to_csv(csv_worst, index=False)
+    df_force = pd.DataFrame(rows_force); df_force.to_csv(csv_forces, index=False)
+
+    return dict(outdir=outdir, plots_dir=plots_dir,
+                csv_areas=csv_areas, csv_worst=csv_worst, csv_forces=csv_forces,
+                df_area=df_area, df_worst=df_worst, df_force=df_force)
+
+# ----------------------------- Run (change variant here) -----------------------------
+VARIANT_NAME = "R290"   # "R32" or "R290"
+out = solve_and_export(VARIANT_NAME, deg_step=10.0, deg_step2=10.0, make_plots=True, base_root="/mnt/data")
+
+print("Output directory:", out["outdir"])
+print("Areas CSV:", out["csv_areas"])
+print("Worst CSV:", out["csv_worst"])
+print("Forces CSV:", out["csv_forces"])
+print("Plots dir:", out["plots_dir"])
+
+# Show a quick head of each CSV
+print("\nAreas head:")
+print(out["df_area"].head(3))
+print("\nWorst head:")
+print(out["df_worst"].head(3))
+print("\nForces head:")
+print(out["df_force"].head(3))
